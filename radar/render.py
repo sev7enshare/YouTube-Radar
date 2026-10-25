@@ -129,3 +129,15 @@ def render_index(videos: list[sqlite3.Row], generated_at: datetime) -> str:
     lines += ["", "状态：pending=等待处理，analyzed=已分析，unavailable=字幕不可用，ignored=加入频道前的旧视频。", ""]
     return "\n".join(lines)
 
+
+def render_channel_index(name: str, url: str, videos: list[sqlite3.Row]) -> str:
+    if url.startswith("@"):
+        url = "https://www.youtube.com/" + url
+    lines = [f"# {safe_text(name)}", "", f"[打开 YouTube 频道]({url})", "", "## 视频笔记", ""]
+    if not videos:
+        lines.append("尚无新视频笔记。频道加入前的视频默认不回溯分析。")
+    for row in videos:
+        title = safe_text(row["title"]).replace("|", "\\|")
+        lines.append(f"- {published_local(row):%Y-%m-%d} · [[{note_path(row).removesuffix('.md')}|{title}]]")
+    return "\n".join(lines) + "\n"
+

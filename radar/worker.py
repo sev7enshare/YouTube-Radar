@@ -14,23 +14,32 @@ from .db import (add_channel, connect, due_videos, finish_video, iso, processed_
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
 from .providers import latest_videos, parse_timestamp, transcript
-from .render import (image_path, note_path, published_local, render_index, render_note,
+from .render import (image_path, note_path, published_local, render_channel_index, render_index, render_note,
                      render_transcript, safe_component, transcript_path)
 
 
 log = logging.getLogger(__name__)
 
 
+def channel_folder(db: sqlite3.Connection, channel_id: int, channel_name: str) -> str:
+    assigned = db.execute("SELECT artifact_base FROM videos WHERE channel_ref=? AND artifact_base IS NOT NULL LIMIT 1",
+                          (channel_id,)).fetchone()
+    if assigned:
+        return assigned["artifact_base"].split("/", 2)[1]
+    folder = safe_component(channel_name, 72)
+    for other in db.execute("SELECT id, name FROM channels WHERE id<?", (channel_id,)):
+        if safe_component(other["name"], 72) == folder:
+            source = db.execute("SELECT url FROM channels WHERE id=?", (channel_id,)).fetchone()
+            handle = safe_component(source["url"].rstrip("/").rsplit("/", 1)[-1].lstrip("@"), 32)
+            folder += f" ({handle})"
+            break
+    return folder
+
+
 def assign_artifact_base(db: sqlite3.Connection, row: sqlite3.Row) -> None:
     if row["artifact_base"]:
         return
-    channel = safe_component(row["channel_name"], 72)
-    for other in db.execute("SELECT id, name FROM channels WHERE id<?", (row["channel_ref"],)):
-        if safe_component(other["name"], 72) == channel:
-            source = db.execute("SELECT url FROM channels WHERE id=?", (row["channel_ref"],)).fetchone()
-            handle = safe_component(source["url"].rstrip("/").rsplit("/", 1)[-1].lstrip("@"), 32)
-            channel += f" ({handle})"
-            break
+    channel = channel_folder(db, row["channel_ref"], row["channel_name"])
     stem = f"{published_local(row):%Y-%m-%d}-{safe_component(row['title'], 120)}"
     base = f"YouTube Radar/{channel}/{stem}"
     number = 2
@@ -132,6 +141,18 @@ def refresh_notes(db: sqlite3.Connection, now: datetime) -> None:
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
 
 
+def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
+    channels = db.execute("SELECT * FROM channels WHERE url!='@manual' AND name IS NOT NULL ORDER BY id").fetchall()
+    with db:
+        for channel in channels:
+            folder = channel_folder(db, channel["id"], channel["name"])
+            videos = db.execute("""SELECT * FROM videos WHERE channel_ref=? AND status='analyzed'
+                ORDER BY published_at DESC LIMIT 100""", (channel["id"],)).fetchall()
+            put_artifact(db, f"YouTube Radar/{folder}/频道索引.md",
+                         render_channel_index(channel["name"], channel["url"], videos).encode(),
+                         "text/markdown", now)
+
+
 def run_once(config: Config) -> dict[str, int]:
     config.require_worker_keys()
     db = connect(config.db_path)
@@ -173,6 +194,7 @@ def run_once(config: Config) -> dict[str, int]:
                 retry_video(db, row["id"], str(exc), now, min(240, 30 * 2 ** min(row["attempts"], 3)))
                 log.exception("Analysis failed for %s", row["id"])
         refresh_notes(db, now)
+        refresh_channel_indexes(db, now)
         recent = db.execute("""SELECT * FROM videos WHERE status!='ignored' AND published_at>=?
             ORDER BY published_at DESC LIMIT 100""", (iso(now - timedelta(days=7)),)).fetchall()
         with db:

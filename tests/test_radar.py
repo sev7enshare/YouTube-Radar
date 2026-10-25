@@ -163,6 +163,10 @@ class RadarTests(unittest.TestCase):
         self.assertEqual(counts["new_videos"], 0)
         db = connect(self.config.db_path)
         self.assertEqual(db.execute("SELECT status FROM videos WHERE id=?", (video.video_id,)).fetchone()[0], "ignored")
+        home = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
+                          ("YouTube Radar/Sample/频道索引.md",)).fetchone()
+        self.assertIsNotNone(home)
+        self.assertIn("尚无新视频笔记", home["body"].decode())
         db.close()
 
     def test_sync_rejects_unsafe_paths(self) -> None:
