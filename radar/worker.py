@@ -5,6 +5,7 @@ import logging
 import re
 import sqlite3
 import urllib.request
+from hashlib import sha256
 from datetime import datetime, timedelta
 
 from .analysis import analyze
@@ -13,10 +14,61 @@ from .db import (add_channel, connect, due_videos, finish_video, iso, processed_
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
 from .providers import latest_videos, parse_timestamp, transcript
-from .render import note_path, render_index, render_note, render_transcript
+from .render import (image_path, note_path, published_local, render_index, render_note,
+                     render_transcript, safe_component, transcript_path)
 
 
 log = logging.getLogger(__name__)
+
+
+def assign_artifact_base(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    if row["artifact_base"]:
+        return
+    channel = safe_component(row["channel_name"], 72)
+    for other in db.execute("SELECT id, name FROM channels WHERE id<?", (row["channel_ref"],)):
+        if safe_component(other["name"], 72) == channel:
+            source = db.execute("SELECT url FROM channels WHERE id=?", (row["channel_ref"],)).fetchone()
+            handle = safe_component(source["url"].rstrip("/").rsplit("/", 1)[-1].lstrip("@"), 32)
+            channel += f" ({handle})"
+            break
+    stem = f"{published_local(row):%Y-%m-%d}-{safe_component(row['title'], 120)}"
+    base = f"YouTube Radar/{channel}/{stem}"
+    number = 2
+    while db.execute("SELECT 1 FROM videos WHERE artifact_base=? AND id!=?", (base, row["id"])).fetchone():
+        base = f"YouTube Radar/{channel}/{stem} ({number})"
+        number += 1
+    db.execute("UPDATE videos SET artifact_base=? WHERE id=?", (base, row["id"]))
+
+
+def retire_artifact(db: sqlite3.Connection, path: str, now: datetime) -> None:
+    previous = db.execute("SELECT body, mime FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1", (path,)).fetchone()
+    if previous and previous["mime"] != "application/x-youtube-radar-delete":
+        put_artifact(db, path, sha256(previous["body"]).hexdigest().encode(),
+                     "application/x-youtube-radar-delete", now)
+
+
+def migrate_legacy_artifacts(db: sqlite3.Connection, now: datetime) -> None:
+    rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NULL").fetchall()
+    for row in rows:
+        old_note = f"YouTube Radar/notes/{parse_timestamp(row['published_at']).date().isoformat()}-{row['id']}.md"
+        old_transcript = f"YouTube Radar/transcripts/{row['id']}.md"
+        old_image = f"YouTube Radar/assets/{row['id']}.jpg"
+        cover = db.execute("SELECT body FROM artifacts WHERE path=? AND mime='image/jpeg' ORDER BY revision DESC LIMIT 1",
+                           (old_image,)).fetchone()
+        with db:
+            assign_artifact_base(db, row)
+            fresh = db.execute("SELECT * FROM videos WHERE id=?", (row["id"],)).fetchone()
+            segments = json.loads(row["transcript_json"])
+            analysis = json.loads(row["analysis_json"])
+            put_artifact(db, transcript_path(fresh), render_transcript(fresh, segments, row["language"]).encode(),
+                         "text/markdown", now)
+            if cover:
+                put_artifact(db, image_path(fresh), cover["body"], "image/jpeg", now)
+            note = render_note(fresh, analysis, row["language"], bool(cover), snapshots_for(db, row["id"]))
+            put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
+            for path in (old_note, old_transcript, old_image):
+                retire_artifact(db, path, now)
+        log.info("Moved note into channel folder for %s", row["id"])
 
 
 def thumbnail(video_id: str) -> bytes | None:
@@ -55,11 +107,12 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
     cover = thumbnail(video_id)
     with db:
         finish_video(db, video_id, language, json.dumps(analysis, ensure_ascii=False), now)
+        assign_artifact_base(db, row)
         fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
-        put_artifact(db, f"YouTube Radar/transcripts/{video_id}.md",
+        put_artifact(db, transcript_path(fresh),
                      render_transcript(fresh, segments, language).encode(), "text/markdown", now)
         if cover:
-            put_artifact(db, f"YouTube Radar/assets/{video_id}.jpg", cover, "image/jpeg", now)
+            put_artifact(db, image_path(fresh), cover, "image/jpeg", now)
         note = render_note(fresh, analysis, language, bool(cover), snapshots_for(db, video_id))
         put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
     log.info("Analyzed %s", video_id)
@@ -71,8 +124,8 @@ def refresh_notes(db: sqlite3.Connection, now: datetime) -> None:
         AND published_at>=?""", (cutoff, iso(now - timedelta(days=7)))).fetchall()
     with db:
         for row in rows:
-            has_image = db.execute("SELECT 1 FROM artifacts WHERE path=? LIMIT 1",
-                                   (f"YouTube Radar/assets/{row['id']}.jpg",)).fetchone() is not None
+            has_image = db.execute("SELECT 1 FROM artifacts WHERE path=? AND mime='image/jpeg' LIMIT 1",
+                                   (image_path(row),)).fetchone() is not None
             note = render_note(row, json.loads(row["analysis_json"]), row["language"], has_image,
                                snapshots_for(db, row["id"]))
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
@@ -85,6 +138,7 @@ def run_once(config: Config) -> dict[str, int]:
     now = utc_now()
     counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0}
     try:
+        migrate_legacy_artifacts(db, now)
         if config.channels_file.exists():
             for line in config.channels_file.read_text(encoding="utf-8").splitlines():
                 value = line.strip()

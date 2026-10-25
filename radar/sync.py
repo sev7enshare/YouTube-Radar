@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -97,11 +98,24 @@ def sync_to_vault(base_url: str, token: str, vault: Path) -> int:
         for artifact in artifacts:
             relative = safe_artifact_path(artifact["path"])
             target = vault.joinpath(*relative.parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
             body = base64.b64decode(artifact["body_base64"], validate=True)
-            temp = target.with_name(target.name + ".radar-tmp")
-            temp.write_bytes(body)
-            os.replace(temp, target)
+            if artifact["mime"] == "application/x-youtube-radar-delete":
+                expected = body.decode("ascii")
+                if (len(expected) == 64 and target.is_file() and not target.is_symlink() and
+                        hashlib.sha256(target.read_bytes()).hexdigest() == expected):
+                    target.unlink()
+                    parent = target.parent
+                    while parent != vault / "YouTube Radar":
+                        try:
+                            parent.rmdir()
+                        except OSError:
+                            break
+                        parent = parent.parent
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp = target.with_name(target.name + ".radar-tmp")
+                temp.write_bytes(body)
+                os.replace(temp, target)
             cursor = int(artifact["revision"])
             state_temp = state_file.with_suffix(".tmp")
             state_temp.write_text(json.dumps({"revision": cursor}))

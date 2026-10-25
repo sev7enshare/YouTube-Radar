@@ -46,7 +46,8 @@ def connect(path: Path) -> sqlite3.Connection:
             transcript_json TEXT,
             analysis_json TEXT,
             analyzed_at TEXT,
-            note_refreshed_at TEXT
+            note_refreshed_at TEXT,
+            artifact_base TEXT
         );
         CREATE INDEX IF NOT EXISTS videos_pending ON videos(status, next_attempt_at);
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -63,6 +64,8 @@ def connect(path: Path) -> sqlite3.Connection:
             created_at TEXT NOT NULL
         );
     """)
+    if "artifact_base" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
+        db.execute("ALTER TABLE videos ADD COLUMN artifact_base TEXT")
     db.commit()
     return db
 
