@@ -43,6 +43,21 @@ python3 -m radar run-once
 
 目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`。设置字幕服务密钥后，先运行 `python3 -m radar check-channels`，确认三个链接都能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
 
+## 本机 Docker 验收
+
+先复制 `.env.example` 为 `.env`，填写字幕服务、模型密钥及模型名。首次启动会把三个频道已有视频记录为基线，之后只自动分析新发布的视频。只启动 worker，并把同步 API 限制在本机端口：
+
+```sh
+docker compose -f compose.yaml -f compose.local.yaml up -d --build radar
+curl http://127.0.0.1:18765/health
+docker compose -f compose.yaml -f compose.local.yaml exec radar python -m radar check-channels
+docker compose -f compose.yaml -f compose.local.yaml logs --tail 50 radar
+```
+
+要用一条已有视频验证完整的字幕、AI 分析与笔记流程，可运行 `docker compose -f compose.yaml -f compose.local.yaml exec radar python -m radar add-video VIDEO_ID`，然后运行 `docker compose -f compose.yaml -f compose.local.yaml exec radar python -m radar run-once`。手动加入会把基线中被忽略的同一视频重新排队；这一步会产生 API 费用。
+
+本机同步时将 `local.env` 的 `RADAR_SERVER_URL` 设为 `http://127.0.0.1:18765`，同步令牌与 `.env` 保持一致，再执行 `zsh scripts/run_sync.sh`。验收结束后可运行 `docker compose -f compose.yaml -f compose.local.yaml down` 停止本机服务；`data/` 不会被删除。
+
 ## 云端常驻
 
 在有公网 IP、域名解析和 Docker Compose 的服务器上，复制代码与 `.env`，运行：

@@ -38,6 +38,9 @@ class RadarTests(unittest.TestCase):
         self.assertEqual((count, ignored), (1, 1))
         self.assertEqual(db.execute("SELECT status FROM videos WHERE id=?", (old.video_id,)).fetchone()[0], "ignored")
         self.assertEqual(db.execute("SELECT status FROM videos WHERE id=?", (new.video_id,)).fetchone()[0], "pending")
+        self.assertTrue(add_video(db, old.video_id))
+        self.assertEqual(db.execute("SELECT status FROM videos WHERE id=?", (old.video_id,)).fetchone()[0], "pending")
+        self.assertFalse(add_video(db, old.video_id))
         db.close()
 
     def test_analyze_and_sync_into_vault(self) -> None:

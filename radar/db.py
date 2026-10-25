@@ -88,6 +88,10 @@ def add_video(db: sqlite3.Connection, video_id: str, channel_url: str = "@manual
             (id, channel_ref, channel_name, title, published_at, status, next_attempt_at)
             VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
             (video_id, channel["id"], channel_url, video_id, iso(utc_now() - timedelta(hours=4)), iso(utc_now())))
+        if result.rowcount:
+            return True
+        result = db.execute("""UPDATE videos SET status='pending', next_attempt_at=?, last_error=NULL
+            WHERE id=? AND status IN ('ignored', 'unavailable')""", (iso(utc_now()), video_id))
     return result.rowcount > 0
 
 
