@@ -39,7 +39,7 @@ python3 -m radar list
 python3 -m radar run-once
 ```
 
-想验证一条旧视频，可运行 `python3 -m radar add-video VIDEO_ID`，再运行 `run-once`。它会发生字幕服务及模型调用费用。频道链接未提供前，不会发起任何付费请求。
+想验证一条旧视频，可运行 `python3 -m radar add-video VIDEO_ID`，再运行 `run-once`。它会发生字幕服务及模型调用费用。未配置密钥时，不会发起付费请求。
 
 目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`。设置字幕服务密钥后，先运行 `python3 -m radar check-channels`，确认三个链接都能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
 
@@ -76,7 +76,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.youtube-radar
 - 官方 YouTube 字幕下载接口要求对视频有编辑权限，因此此工具使用第三方字幕服务；服务的覆盖率、价格与可用性需要用你指定的真实频道验证。见 [官方接口权限](https://developers.google.com/youtube/data/reference/rest/v3/captions/download)。
 - 目前记录播放量快照，但**不自动称某条视频为“爆款”**。需要积累同频道、同类型、相同发布时长的样本后才适合计算相对热度。
 - AI 分析依据字幕；视频画面中的图表、操作演示和封面之外的视觉信息暂未解析。
-- 当前是可部署的命令行工具，未提供桌面图形界面。云端部署和真实频道测试需要频道链接、云服务器或托管平台，以及你自行配置的密钥。
+- 当前是可部署的命令行工具，未提供桌面图形界面。三个频道链接已配置；云端部署和真实频道测试仍需你在服务器配置密钥。
 
 ## 测试
 
