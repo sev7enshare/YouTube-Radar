@@ -1,0 +1,32 @@
+services:
+  radar:
+    build: .
+    env_file: .env
+    environment:
+      RADAR_DB: /data/radar.sqlite3
+      RADAR_LISTEN_HOST: 0.0.0.0
+    volumes:
+      - ./data:/data
+    expose:
+      - "8765"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    environment:
+      RADAR_DOMAIN: ${RADAR_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - radar
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+

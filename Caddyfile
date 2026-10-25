@@ -1,0 +1,4 @@
+{$RADAR_DOMAIN} {
+    reverse_proxy radar:8765
+}
+

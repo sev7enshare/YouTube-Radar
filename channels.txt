@@ -1,0 +1,4 @@
+# One YouTube channel URL per line. Existing uploads are treated as baseline on first run.
+https://www.youtube.com/@huangsiping
+https://www.youtube.com/@7techlife
+https://www.youtube.com/@sev7enshare
