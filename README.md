@@ -58,7 +58,7 @@ docker compose logs -f radar
 本机复制 `local.env.example` 为 `local.env`，只填写云端 URL 和与云端一致的同步令牌。本机无需保存字幕服务或 AI 密钥。手动同步一次：
 
 ```sh
-./scripts/run_sync.sh
+zsh scripts/run_sync.sh
 ```
 
 Mac 自动同步模板已放在 `scripts/com.youtube-radar.sync.plist.in`。`local.env` 填好后，生成适用于当前项目路径的用户 LaunchAgent：
