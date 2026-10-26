@@ -2,3 +2,14 @@ services:
   radar:
     ports:
       - "127.0.0.1:18765:8765"
+
+  sync:
+    build: .
+    command: ["python", "-m", "radar", "sync-loop", "--url", "http://127.0.0.1:8765", "--vault", "/vault"]
+    env_file: .env
+    network_mode: "service:radar"
+    volumes:
+      - "${OBSIDIAN_VAULT}:/vault"
+    depends_on:
+      - radar
+    restart: unless-stopped
