@@ -4,15 +4,17 @@ import tempfile
 import unittest
 import base64
 import json
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from radar.analysis import classify_topics, select_valuable_comments
 from radar.config import Config
 from radar.db import add_channel, add_video, artifacts_after, connect, iso, put_artifact, record_discovery, utc_now
-from radar.providers import Video
+from radar.providers import Video, public_comments, video_description
 from radar.sync import safe_artifact_path, sync_to_vault
-from radar.worker import assign_artifact_base, run_once
+from radar.worker import assign_artifact_base, enrich_analyzed, refresh_notes, run_once
 
 
 class RadarTests(unittest.TestCase):
@@ -60,7 +62,9 @@ class RadarTests(unittest.TestCase):
         segments = [{"start": 0.0, "text": "这是一个测试字幕。"}]
         with patch("radar.worker.transcript", return_value=(segments, "zh")), \
              patch("radar.worker.analyze", return_value=analysis), \
-             patch("radar.worker.thumbnail", return_value=b"fake-jpeg"):
+             patch("radar.worker.thumbnail", return_value=b"fake-jpeg"), \
+             patch("radar.worker.video_description", return_value="描述区原文：测试链接"), \
+             patch("radar.worker.classify_topics", return_value=["加密货币走势"]):
             counts = run_once(self.config)
         self.assertEqual(counts["analyzed"], 1)
         vault = self.root / "vault"
@@ -86,11 +90,25 @@ class RadarTests(unittest.TestCase):
         self.assertIn("这条视频讲了一个观点", text)
         self.assertIn("```mermaid", text)
         self.assertIn("Sample 频道", text)
+        self.assertIn("描述区原文：测试链接", text)
+        self.assertIn("[[YouTube Radar/主题/加密货币走势|加密货币走势]]", text)
         self.assertIn(f"![[YouTube Radar/Sample 频道/封面/{notes[0].stem}.jpg]]", text)
         self.assertTrue((channel / "封面" / (notes[0].stem + ".jpg")).exists())
         self.assertTrue((channel / "字幕" / (notes[0].stem + ".md")).exists())
         self.assertIn(f"[[YouTube Radar/Sample 频道/{notes[0].stem}\\|",
                       (vault / "YouTube Radar/最近视频.md").read_text())
+        notes[0].write_text("我的复盘\n" + text)
+        db = connect(self.config.db_path)
+        with db:
+            put_artifact(db, f"YouTube Radar/Sample 频道/{notes[0].name}",
+                         (text + "\n自动更新\n").encode(), "text/markdown", utc_now())
+        db.close()
+        with patch("radar.sync.request_json", side_effect=fake_request):
+            sync_to_vault("http://127.0.0.1:8765", self.config.sync_token, vault)
+        self.assertIn("自动更新", notes[0].read_text())
+        backups = list((vault / ".youtube-radar/backups/YouTube Radar/Sample 频道").glob("*.md"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("我的复盘", backups[0].read_text())
         with patch("radar.sync.request_json", side_effect=fake_request):
             self.assertEqual(sync_to_vault("http://127.0.0.1:8765", self.config.sync_token, vault), 0)
 
@@ -126,7 +144,9 @@ class RadarTests(unittest.TestCase):
             sync_to_vault("http://127.0.0.1:8765", self.config.sync_token, vault)
         old_note = vault / "YouTube Radar/notes/2026-01-01-abcdefghijk.md"
         old_note.write_text("my edited note")
-        run_once(self.config)
+        with patch("radar.worker.video_description", return_value=""), \
+             patch("radar.worker.classify_topics", return_value=[]):
+            run_once(self.config)
         with patch("radar.sync.request_json", side_effect=fake_request):
             sync_to_vault("http://127.0.0.1:8765", self.config.sync_token, vault)
         channel = vault / "YouTube Radar/Sample"
@@ -173,6 +193,97 @@ class RadarTests(unittest.TestCase):
         for value in ("../other.md", "/tmp/other.md", "YouTube Radar/../other.md", "Other/a.md"):
             with self.assertRaises(ValueError):
                 safe_artifact_path(value)
+
+    def test_description_comments_and_cross_video_topic_links(self) -> None:
+        db = connect(self.config.db_path)
+        now = utc_now()
+        base_analysis = {"summary": "比较订阅方法", "hook": "", "sections": [], "claims": [],
+                         "angles": [], "limits": "仅依据字幕"}
+        for video_id, channel in (("abcdefghijk", "频道甲"), ("123456789ab", "频道乙")):
+            add_video(db, video_id)
+            with db:
+                db.execute("""UPDATE videos SET status='analyzed', channel_name=?, title=?,
+                    analysis_json=?, language='zh', published_at=?, analyzed_at=?, note_refreshed_at=? WHERE id=?""",
+                    (channel, channel + "的订阅方案", json.dumps(base_analysis, ensure_ascii=False),
+                     iso(now - timedelta(days=2)), iso(now), iso(now), video_id))
+            with db:
+                assign_artifact_base(db, db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone())
+        config = replace(self.config, youtube_api_key="youtube-test-key")
+        sample = [{"id": "comment.1", "text": "实际订阅时遇到支付失败，怎么解决？", "likes": 5,
+                   "replies": 2, "published_at": iso(now), "author": "观众"}]
+        selected = [{**sample[0], "category": "问题", "why": "暴露支付障碍"}]
+        with patch("radar.worker.video_description", return_value="这是完整描述区。"), \
+             patch("radar.worker.classify_topics", return_value=["AI订阅支付"]), \
+             patch("radar.worker.public_comments", return_value=sample), \
+             patch("radar.worker.select_valuable_comments", return_value=selected):
+            counts = enrich_analyzed(db, config, now)
+        self.assertEqual((counts["descriptions"], counts["topics"], counts["comments"]), (2, 2, 2))
+        refresh_notes(db, now, force_all=True)
+        notes = db.execute("""SELECT path,body FROM artifacts WHERE path LIKE 'YouTube Radar/%/%md'
+            AND path NOT LIKE '%/字幕/%' ORDER BY revision""").fetchall()
+        rendered = [row["body"].decode() for row in notes if "订阅方案" in row["path"]]
+        self.assertEqual(len(rendered), 2)
+        self.assertTrue(all("这是完整描述区" in text and "共同主题：AI订阅支付" in text
+                            and "comment.1" in text for text in rendered))
+        index = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
+                           ("YouTube Radar/主题索引.md",)).fetchone()["body"].decode()
+        self.assertIn("AI订阅支付", index)
+        db.close()
+
+    def test_youtube_metadata_and_comment_sampling(self) -> None:
+        calls = []
+
+        def fake_request(url: str, **kwargs: object) -> dict:
+            calls.append((url, kwargs["params"]))
+            if url.endswith("/videos"):
+                return {"items": [{"snippet": {"description": "完整描述和链接"}}]}
+            comment = {"snippet": {"topLevelComment": {"id": "comment.1", "snippet": {
+                "textDisplay": "我实际尝试后遇到支付失败，应该怎么处理？", "likeCount": 8,
+                "publishedAt": "2026-10-26T00:00:00Z", "authorDisplayName": "观众"}},
+                "totalReplyCount": 3}}
+            return {"items": [comment]}
+
+        with patch("radar.providers.request_json", side_effect=fake_request):
+            self.assertEqual(video_description("abcdefghijk", "transcript-key", "youtube-key"),
+                             "完整描述和链接")
+            comments = public_comments("abcdefghijk", "youtube-key")
+        self.assertEqual(len(comments), 1)
+        self.assertEqual((comments[0]["likes"], comments[0]["replies"]), (8, 3))
+        self.assertEqual([params["order"] for _, params in calls[1:]], ["relevance", "time"])
+
+    def test_topic_and_comment_models_use_their_own_schema(self) -> None:
+        def fake_request(_url: str, **kwargs: object) -> dict:
+            instructions = kwargs["payload"]["instructions"]
+            answer = ({"topics": ["AI订阅支付"]} if "主题索引" in instructions else
+                      {"selected": [{"id": "comment.1", "category": "问题", "why": "支付障碍"}]})
+            return {"output": [{"content": [{"type": "output_text",
+                                              "text": json.dumps(answer, ensure_ascii=False)}]}]}
+
+        comment = {"id": "comment.1", "text": "实际订阅时支付失败，这个问题怎么解决？",
+                   "likes": 4, "replies": 1, "published_at": "2026-10-26T00:00:00Z"}
+        with patch("radar.analysis.request_json", side_effect=fake_request):
+            self.assertEqual(classify_topics(self.config, "标题", "摘要", "描述", []), ["AI订阅支付"])
+            selected = select_valuable_comments(self.config, [comment])
+        self.assertEqual(selected[0]["category"], "问题")
+
+    def test_new_video_comments_are_refreshed_after_24_hours(self) -> None:
+        db = connect(self.config.db_path)
+        add_video(db, "abcdefghijk")
+        now = utc_now()
+        with db:
+            db.execute("""UPDATE videos SET status='analyzed', published_at=?, analysis_json=?,
+                metadata_checked_at=?, topics_json='[]' WHERE id=?""",
+                (iso(now - timedelta(hours=4)), json.dumps({"summary": "摘要"}),
+                 iso(now), "abcdefghijk"))
+        config = replace(self.config, youtube_api_key="youtube-test-key")
+        with patch("radar.worker.public_comments", return_value=[]), \
+             patch("radar.worker.select_valuable_comments", return_value=[]):
+            self.assertEqual(enrich_analyzed(db, config, now)["comments"], 1)
+            self.assertEqual(db.execute("SELECT comments_round FROM videos").fetchone()[0], 1)
+            self.assertEqual(enrich_analyzed(db, config, now + timedelta(hours=2))["comments"], 0)
+            self.assertEqual(enrich_analyzed(db, config, now + timedelta(hours=21))["comments"], 1)
+        self.assertEqual(db.execute("SELECT comments_round FROM videos").fetchone()[0], 2)
+        db.close()
 
 
 if __name__ == "__main__":

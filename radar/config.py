@@ -19,6 +19,7 @@ class Config:
     listen_host: str
     listen_port: int
     channels_file: Path = Path("channels.txt")
+    youtube_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -38,6 +39,7 @@ class Config:
             listen_host=os.getenv("RADAR_LISTEN_HOST", "127.0.0.1"),
             listen_port=int(os.getenv("RADAR_LISTEN_PORT", "8765")),
             channels_file=Path(os.getenv("RADAR_CHANNELS_FILE", "channels.txt")),
+            youtube_api_key=os.getenv("YOUTUBE_API_KEY", ""),
         )
 
     def require_worker_keys(self) -> None:

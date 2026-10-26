@@ -89,7 +89,11 @@ def sync_to_vault(base_url: str, token: str, vault: Path) -> int:
     state_dir = vault / ".youtube-radar"
     state_dir.mkdir(exist_ok=True)
     state_file = state_dir / "state.json"
-    cursor = json.loads(state_file.read_text()).get("revision", 0) if state_file.exists() else 0
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    cursor = int(state.get("revision", 0))
+    file_hashes = state.get("file_hashes") or {}
+    if not isinstance(file_hashes, dict):
+        file_hashes = {}
     written = 0
     while True:
         payload = request_json(base_url.rstrip("/") + "/api/artifacts", token=token,
@@ -97,6 +101,7 @@ def sync_to_vault(base_url: str, token: str, vault: Path) -> int:
         artifacts = payload.get("artifacts") or []
         for artifact in artifacts:
             relative = safe_artifact_path(artifact["path"])
+            relative_key = str(relative)
             target = vault.joinpath(*relative.parts)
             body = base64.b64decode(artifact["body_base64"], validate=True)
             if artifact["mime"] == "application/x-youtube-radar-delete":
@@ -111,14 +116,25 @@ def sync_to_vault(base_url: str, token: str, vault: Path) -> int:
                         except OSError:
                             break
                         parent = parent.parent
+                file_hashes.pop(relative_key, None)
             else:
+                if target.is_file() and not target.is_symlink():
+                    local_body = target.read_bytes()
+                    local_hash = hashlib.sha256(local_body).hexdigest()
+                    new_hash = hashlib.sha256(body).hexdigest()
+                    if local_hash != new_hash and file_hashes.get(relative_key) != local_hash:
+                        backup = state_dir / "backups" / relative.parent / (
+                            f"{relative.stem}.before-r{artifact['revision']}{relative.suffix}")
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        backup.write_bytes(local_body)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temp = target.with_name(target.name + ".radar-tmp")
                 temp.write_bytes(body)
                 os.replace(temp, target)
+                file_hashes[relative_key] = hashlib.sha256(body).hexdigest()
             cursor = int(artifact["revision"])
             state_temp = state_file.with_suffix(".tmp")
-            state_temp.write_text(json.dumps({"revision": cursor}))
+            state_temp.write_text(json.dumps({"revision": cursor, "file_hashes": file_hashes}))
             os.replace(state_temp, state_file)
             written += 1
         if not payload.get("has_more") or not artifacts:

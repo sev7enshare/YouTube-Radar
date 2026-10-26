@@ -66,3 +66,46 @@ def transcript(video_id: str, api_key: str) -> tuple[list[dict[str, Any]], str]:
         raise ValueError("Transcript response contained no usable text")
     return cleaned, str(data.get("language") or "unknown")
 
+
+def video_description(video_id: str, transcript_api_key: str, youtube_api_key: str = "") -> str:
+    """Fetch the full description; the channel RSS feed often omits it."""
+    if youtube_api_key:
+        try:
+            data = request_json("https://www.googleapis.com/youtube/v3/videos",
+                                params={"key": youtube_api_key, "part": "snippet", "id": video_id})
+            items = data.get("items") or []
+            if items:
+                return str((items[0].get("snippet") or {}).get("description") or "")
+        except Exception:
+            pass  # The existing TranscriptAPI source remains available as a fallback.
+    data = request_json(
+        f"{TRANSCRIPT_API}/youtube/video/metadata", token=transcript_api_key,
+        params={"video_url": video_id}, timeout=65,
+    )
+    return str(data.get("description") or "")
+
+
+def public_comments(video_id: str, api_key: str) -> list[dict[str, Any]]:
+    """Sample both YouTube-relevant and recent public top-level comments."""
+    found: dict[str, dict[str, Any]] = {}
+    for order in ("relevance", "time"):
+        data = request_json(
+            "https://www.googleapis.com/youtube/v3/commentThreads",
+            params={"key": api_key, "part": "snippet", "videoId": video_id,
+                    "order": order, "maxResults": "100", "textFormat": "plainText"},
+        )
+        for item in data.get("items") or []:
+            top = (item.get("snippet") or {}).get("topLevelComment") or {}
+            detail = top.get("snippet") or {}
+            comment_id = top.get("id")
+            body = str(detail.get("textDisplay") or "").strip()
+            if comment_id and body:
+                found[comment_id] = {
+                    "id": comment_id, "text": body,
+                    "likes": int(detail.get("likeCount") or 0),
+                    "published_at": str(detail.get("publishedAt") or ""),
+                    "replies": int((item.get("snippet") or {}).get("totalReplyCount") or 0),
+                    "author": str(detail.get("authorDisplayName") or ""),
+                }
+    return list(found.values())
+

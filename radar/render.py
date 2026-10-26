@@ -5,6 +5,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 from .analysis import stamp, transcript_lines
 from .providers import parse_timestamp
@@ -61,6 +62,16 @@ def image_path(row: sqlite3.Row) -> str:
     return f"{folder}/封面/{stem}.jpg"
 
 
+def topic_path(name: str) -> str:
+    return f"YouTube Radar/主题/{safe_component(name, 72)}.md"
+
+
+def source_quote(value: str) -> list[str]:
+    """Keep source text visible without letting it create vault embeds or HTML."""
+    cleaned = value.replace("<", "&lt;").replace("![[", r"\!\[\[").replace("[[", r"\[\[")
+    return ["> " + line for line in cleaned.splitlines()]
+
+
 def render_transcript(row: sqlite3.Row, segments: list[dict[str, Any]], language: str) -> str:
     lines = [f"# {safe_text(row['title'])} · 字幕", "",
              f"频道：{safe_text(row['channel_name'])}", f"来源：{link(row['id'], 0)}", f"语言：{language}", "",
@@ -72,12 +83,16 @@ def render_transcript(row: sqlite3.Row, segments: list[dict[str, Any]], language
 
 
 def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
-                has_image: bool, snapshots: list[sqlite3.Row]) -> str:
+                has_image: bool, snapshots: list[sqlite3.Row], topics: list[str] | None = None,
+                related: list[tuple[str, str, list[str]]] | None = None,
+                comments: list[dict[str, Any]] | None = None) -> str:
     video_id = row["id"]
     title = safe_text(row["title"])
+    topics = topics or []
     lines = ["---", f"title: {yaml_quote(title)}", f"channel: {yaml_quote(row['channel_name'])}",
              f"published: {yaml_quote(row['published_at'])}", f"video_id: {yaml_quote(video_id)}",
-             f"language: {yaml_quote(language)}", "tags: [youtube-radar]", "---", "",
+             f"language: {yaml_quote(language)}", "tags: [youtube-radar]",
+             "topics: [" + ", ".join(yaml_quote(topic) for topic in topics) + "]", "---", "",
              f"# {title}", ""]
     if has_image:
         lines += [f"![[{image_path(row)}]]", ""]
@@ -109,6 +124,33 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     lines += ["", "## 我的差异化选题机会", ""]
     for angle in (analysis.get("angles") or [])[:8]:
         lines.append(f"- **{safe_text(angle.get('idea'))}**：{safe_text(angle.get('why'))}")
+    lines += ["", "## 主题与相关视频", ""]
+    if topics:
+        lines.append("主题：" + " · ".join(
+            f"[[{topic_path(name).removesuffix('.md')}|{name}]]" for name in topics))
+    else:
+        lines.append("尚未完成主题分类。")
+    for path, other_title, shared in (related or [])[:12]:
+        lines.append(f"- [[{path.removesuffix('.md')}|{other_title}]] · 共同主题：{'、'.join(shared)}")
+    if not related:
+        lines.append("暂无已收录的同主题视频。")
+    lines += ["", "## 视频描述区原文", ""]
+    description = str(row["description"] or "").strip()
+    lines += source_quote(description) if description else ["尚未取得描述区内容。"]
+    lines += ["", "## 观众评论 · 精选", ""]
+    if comments is None:
+        lines.append("尚未采集评论；需要启用 YouTube Data API v3。")
+    elif not comments:
+        lines.append("暂无可用的公开评论。")
+    else:
+        lines.append("评论反映个别观众体验，不代表全部观众；原文可能随后被作者修改或删除。")
+        for item in comments[:10]:
+            url = f"https://www.youtube.com/watch?v={video_id}&lc={quote(str(item['id']), safe='')}"
+            category = safe_text(item.get("category"))
+            lines += ["", f"### [{category} · {int(item.get('likes') or 0)} 赞]({url})", ""]
+            lines += source_quote(str(item.get("text") or ""))
+            if item.get("why"):
+                lines.append(f"筛选原因：{safe_text(item['why'])}")
     lines += ["", "## 播放数据快照", "", "| 采集时间 UTC | 播放量 |", "|---|---:|"]
     for snapshot in snapshots[-20:]:
         lines.append(f"| {snapshot['captured_at']} | {snapshot['view_count']:,} |")
@@ -139,5 +181,21 @@ def render_channel_index(name: str, url: str, videos: list[sqlite3.Row]) -> str:
     for row in videos:
         title = safe_text(row["title"]).replace("|", "\\|")
         lines.append(f"- {published_local(row):%Y-%m-%d} · [[{note_path(row).removesuffix('.md')}|{title}]]")
+    return "\n".join(lines) + "\n"
+
+
+def render_topic_index(groups: dict[str, list[sqlite3.Row]]) -> str:
+    lines = ["# YouTube Radar · 主题索引", "", "按视频核心问题归类；同一视频可以属于多个主题。", ""]
+    for name in sorted(groups):
+        lines.append(f"- [[{topic_path(name).removesuffix('.md')}|{name}]] · {len(groups[name])} 条视频")
+    return "\n".join(lines) + "\n"
+
+
+def render_topic_note(name: str, videos: list[sqlite3.Row]) -> str:
+    lines = ["---", f"title: {yaml_quote(name)}", "tags: [youtube-radar, youtube-radar/topic]",
+             "---", "", f"# {name}", "", "## 相关视频", ""]
+    for row in sorted(videos, key=lambda item: item["published_at"], reverse=True):
+        lines.append(f"- {published_local(row):%Y-%m-%d} · {safe_text(row['channel_name'])} · "
+                     f"[[{note_path(row).removesuffix('.md')}|{safe_text(row['title'])}]]")
     return "\n".join(lines) + "\n"
 

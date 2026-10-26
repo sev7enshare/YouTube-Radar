@@ -47,7 +47,15 @@ def connect(path: Path) -> sqlite3.Connection:
             analysis_json TEXT,
             analyzed_at TEXT,
             note_refreshed_at TEXT,
-            artifact_base TEXT
+            artifact_base TEXT,
+            metadata_checked_at TEXT,
+            metadata_next_attempt_at TEXT,
+            topics_json TEXT,
+            topics_next_attempt_at TEXT,
+            comments_json TEXT,
+            comments_round INTEGER NOT NULL DEFAULT 0,
+            comments_next_attempt_at TEXT,
+            comments_error TEXT
         );
         CREATE INDEX IF NOT EXISTS videos_pending ON videos(status, next_attempt_at);
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -64,8 +72,21 @@ def connect(path: Path) -> sqlite3.Connection:
             created_at TEXT NOT NULL
         );
     """)
-    if "artifact_base" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
-        db.execute("ALTER TABLE videos ADD COLUMN artifact_base TEXT")
+    columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
+    additions = {
+        "artifact_base": "TEXT",
+        "metadata_checked_at": "TEXT",
+        "metadata_next_attempt_at": "TEXT",
+        "topics_json": "TEXT",
+        "topics_next_attempt_at": "TEXT",
+        "comments_json": "TEXT",
+        "comments_round": "INTEGER NOT NULL DEFAULT 0",
+        "comments_next_attempt_at": "TEXT",
+        "comments_error": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
     db.commit()
     return db
 
@@ -117,9 +138,10 @@ def record_discovery(db: sqlite3.Connection, channel: sqlite3.Row, videos: list[
                 new += int(is_new)
                 ignored += int(not is_new)
             else:
-                db.execute("""UPDATE videos SET title=?, description=?, view_count=?, channel_name=?
+                db.execute("""UPDATE videos SET title=?, description=CASE WHEN ?!='' THEN ? ELSE description END,
+                    view_count=?, channel_name=?
                     WHERE id=? AND channel_ref=?""", (
-                        video.title, video.description, video.view_count, video.channel_name,
+                        video.title, video.description, video.description, video.view_count, video.channel_name,
                         video.video_id, channel["id"],
                     ))
             if video.view_count is not None:

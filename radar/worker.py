@@ -8,14 +8,15 @@ import urllib.request
 from hashlib import sha256
 from datetime import datetime, timedelta
 
-from .analysis import analyze
+from .analysis import analyze, classify_topics, select_valuable_comments
 from .config import Config
 from .db import (add_channel, connect, due_videos, finish_video, iso, processed_today,
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
-from .providers import latest_videos, parse_timestamp, transcript
+from .providers import latest_videos, parse_timestamp, public_comments, transcript, video_description
 from .render import (image_path, note_path, published_local, render_channel_index, render_index, render_note,
-                     render_transcript, safe_component, transcript_path)
+                     render_topic_index, render_topic_note, render_transcript, safe_component, transcript_path,
+                     topic_path)
 
 
 log = logging.getLogger(__name__)
@@ -127,18 +128,114 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
     log.info("Analyzed %s", video_id)
 
 
-def refresh_notes(db: sqlite3.Connection, now: datetime) -> None:
-    cutoff = iso(now - timedelta(hours=3))
-    rows = db.execute("""SELECT * FROM videos WHERE status='analyzed' AND note_refreshed_at<?
-        AND published_at>=?""", (cutoff, iso(now - timedelta(days=7)))).fetchall()
+def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> dict[str, int]:
+    """Fill optional sources independently so outages never discard the core analysis."""
+    counts = {"descriptions": 0, "topics": 0, "comments": 0}
+    rows = db.execute("SELECT * FROM videos WHERE status='analyzed' ORDER BY published_at").fetchall()
+    catalog: list[str] = []
+    for row in rows:
+        if row["topics_json"]:
+            for name in json.loads(row["topics_json"]):
+                if name not in catalog:
+                    catalog.append(name)
+    for row in rows:
+        video_id = row["id"]
+        if not row["metadata_checked_at"] and (not row["metadata_next_attempt_at"] or
+                                                  row["metadata_next_attempt_at"] <= iso(now)):
+            try:
+                description = video_description(video_id, config.transcript_api_key, config.youtube_api_key)
+                with db:
+                    db.execute("""UPDATE videos SET description=CASE WHEN ?!='' THEN ? ELSE description END,
+                        metadata_checked_at=?, metadata_next_attempt_at=NULL WHERE id=?""",
+                        (description, description, iso(now), video_id))
+                counts["descriptions"] += 1
+            except Exception as exc:
+                with db:
+                    db.execute("UPDATE videos SET metadata_next_attempt_at=? WHERE id=?",
+                               (iso(now + timedelta(hours=1)), video_id))
+                log.warning("Description fetch deferred for %s: %s", video_id, exc)
+        fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
+        if fresh["topics_json"] is None and (not fresh["topics_next_attempt_at"] or
+                                              fresh["topics_next_attempt_at"] <= iso(now)):
+            try:
+                analysis = json.loads(fresh["analysis_json"])
+                topics = classify_topics(config, fresh["title"], analysis.get("summary", ""),
+                                         fresh["description"], catalog)
+                with db:
+                    db.execute("UPDATE videos SET topics_json=?, topics_next_attempt_at=NULL WHERE id=?",
+                               (json.dumps(topics, ensure_ascii=False), video_id))
+                for name in topics:
+                    if name not in catalog:
+                        catalog.append(name)
+                counts["topics"] += 1
+            except Exception as exc:
+                with db:
+                    db.execute("UPDATE videos SET topics_next_attempt_at=? WHERE id=?",
+                               (iso(now + timedelta(hours=1)), video_id))
+                log.warning("Topic classification deferred for %s: %s", video_id, exc)
+        if not config.youtube_api_key:
+            continue
+        fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
+        due_second = fresh["comments_round"] == 1 and now >= parse_timestamp(fresh["published_at"]) + timedelta(hours=24)
+        if (fresh["comments_round"] == 0 or due_second) and (not fresh["comments_next_attempt_at"] or
+                                                               fresh["comments_next_attempt_at"] <= iso(now)):
+            try:
+                sample = public_comments(video_id, config.youtube_api_key)
+                selected = select_valuable_comments(config, sample)
+                round_number = 2 if now >= parse_timestamp(fresh["published_at"]) + timedelta(hours=24) else 1
+                with db:
+                    db.execute("""UPDATE videos SET comments_json=?, comments_round=?,
+                        comments_next_attempt_at=NULL, comments_error=NULL WHERE id=?""",
+                        (json.dumps(selected, ensure_ascii=False), round_number, video_id))
+                counts["comments"] += 1
+            except HttpError as exc:
+                disabled = exc.status == 403 and "commentsDisabled" in str(exc)
+                with db:
+                    db.execute("""UPDATE videos SET comments_json=CASE WHEN ? THEN '[]' ELSE comments_json END,
+                        comments_round=CASE WHEN ? THEN 2 ELSE comments_round END,
+                        comments_next_attempt_at=?, comments_error=? WHERE id=?""",
+                        (disabled, disabled, None if disabled else iso(now + timedelta(hours=1)), str(exc)[:500], video_id))
+                log.warning("Comment fetch deferred for %s: %s", video_id, exc)
+            except Exception as exc:
+                with db:
+                    db.execute("UPDATE videos SET comments_next_attempt_at=?, comments_error=? WHERE id=?",
+                               (iso(now + timedelta(hours=1)), str(exc)[:500], video_id))
+                log.warning("Comment fetch deferred for %s: %s", video_id, exc)
+    return counts
+
+
+def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False) -> None:
+    rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NOT NULL").fetchall()
+    topics_by_id = {row["id"]: json.loads(row["topics_json"] or "[]") for row in rows}
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        for name in topics_by_id[row["id"]]:
+            groups.setdefault(name, []).append(row)
     with db:
         for row in rows:
+            if not force_all and (row["published_at"] < iso(now - timedelta(days=7)) or
+                                  (row["note_refreshed_at"] and
+                                   row["note_refreshed_at"] >= iso(now - timedelta(hours=3)))):
+                continue
             has_image = db.execute("SELECT 1 FROM artifacts WHERE path=? AND mime='image/jpeg' LIMIT 1",
                                    (image_path(row),)).fetchone() is not None
+            own_topics = topics_by_id[row["id"]]
+            related = []
+            for other in rows:
+                if other["id"] == row["id"]:
+                    continue
+                shared = [name for name in own_topics if name in topics_by_id[other["id"]]]
+                if shared:
+                    related.append((note_path(other), other["title"], shared))
+            related.sort(key=lambda item: item[0], reverse=True)
+            comments = json.loads(row["comments_json"]) if row["comments_json"] is not None else None
             note = render_note(row, json.loads(row["analysis_json"]), row["language"], has_image,
-                               snapshots_for(db, row["id"]))
+                               snapshots_for(db, row["id"]), own_topics, related, comments)
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
+        put_artifact(db, "YouTube Radar/主题索引.md", render_topic_index(groups).encode(), "text/markdown", now)
+        for name, videos in groups.items():
+            put_artifact(db, topic_path(name), render_topic_note(name, videos).encode(), "text/markdown", now)
 
 
 def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
@@ -157,7 +254,8 @@ def run_once(config: Config) -> dict[str, int]:
     config.require_worker_keys()
     db = connect(config.db_path)
     now = utc_now()
-    counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0}
+    counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0,
+              "descriptions": 0, "topics": 0, "comments": 0}
     try:
         migrate_legacy_artifacts(db, now)
         if config.channels_file.exists():
@@ -193,7 +291,9 @@ def run_once(config: Config) -> dict[str, int]:
                 counts["errors"] += 1
                 retry_video(db, row["id"], str(exc), now, min(240, 30 * 2 ** min(row["attempts"], 3)))
                 log.exception("Analysis failed for %s", row["id"])
-        refresh_notes(db, now)
+        counts.update(enrich_analyzed(db, config, now))
+        refresh_notes(db, now, force_all=any(counts[key] for key in
+                      ("analyzed", "descriptions", "topics", "comments")))
         refresh_channel_indexes(db, now)
         recent = db.execute("""SELECT * FROM videos WHERE status!='ignored' AND published_at>=?
             ORDER BY published_at DESC LIMIT 100""", (iso(now - timedelta(days=7)),)).fetchall()
