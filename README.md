@@ -6,6 +6,7 @@
 
 - 每 15 分钟检查频道最近 15 条视频；首次加入时只将已有视频作为基线，不付费回溯分析。
 - 视频达到设定年龄后取字幕，按完整字幕拆解观点、结构、钩子和差异化选题。长视频分段处理。
+- 视频没有 YouTube 字幕且配置了 Gemini Key 时，使用 Gemini 直接读取公开视频语音与画面，生成带近似时间点的 AI 内容记录，再按同一版式分析；长视频若未覆盖后半段，会分段补读，最多额外请求三次。笔记明确标记这不是逐字字幕。此功能依赖 Google 的预览版 YouTube URL 视频输入能力。
 - 每个频道各有一个 Obsidian 文件夹和“频道索引”，即使还没有新视频笔记也能看到该频道；笔记以北京时间的发布日期和视频标题命名，同频道内保存完整字幕和封面图片。笔记包含时间点链接、Mermaid 结构图、播放量快照及资料局限。
 - 已分析视频会补取完整描述区，提取 1–3 个主题；“主题索引”和主题笔记把不同频道讨论同一主题的视频双链起来。描述区优先使用已配置的 YouTube Data API；没有该密钥时用 TranscriptAPI 视频元数据接口（每条成功请求另用 1 个积分）。失败一小时后重试且不阻断字幕笔记。
 - 配置 `YOUTUBE_API_KEY` 后，会从 YouTube Data API v3 各取一页“相关”和“最新”公开评论，去重并筛选最多 10 条有信息量的评论，保留评论原文、点赞数、筛选原因及原评论链接。新视频发布约 24 小时后再补取一次；关闭评论或接口失败时不阻断主体笔记。
@@ -16,12 +17,14 @@
 
 ## 密钥与配置
 
-复制 `.env.example` 为 `.env`，填写以下值。`.env` 已被 Git 忽略；不要把密钥提交到仓库或贴进聊天。当前三个频道已写在 [`channels.txt`](channels.txt) 中，云端启动时自动导入；以后每行增删一个链接即可。
+复制 `.env.example` 为 `.env`，填写以下值。`.env` 已被 Git 忽略；不要把密钥提交到仓库或贴进聊天。当前六个频道已写在 [`channels.txt`](channels.txt) 中，云端启动时自动导入；以后每行增删一个链接即可。
 
 | 变量 | 用途 |
 |---|---|
 | `TRANSCRIPT_API_KEY` | [TranscriptAPI](https://transcriptapi.com/docs/api/) 的密钥，用于频道更新与字幕。频道最新视频接口不扣积分，但账户仍需至少有一笔有效积分；每次成功取字幕按服务商计费。 |
 | `YOUTUBE_API_KEY` | 可选；Google Cloud 项目中启用了 YouTube Data API v3 的 API Key，用于公开评论。没有它，描述区与主题功能仍可运行，评论部分留空。Gemini API Key 不保证启用了此 API。 |
+| `GEMINI_API_KEY` 或 `gemini_API_KEY` | 可选；在字幕服务返回 `no_captions` 时，读取公开视频语音与画面并生成近似内容记录。Gemini 模型调用可能产生费用；长视频分段补读会增加调用次数。 |
+| `GEMINI_VIDEO_MODEL` | Gemini 视频模型，默认 `gemini-2.5-flash`；更换模型前需确认它支持 YouTube URL 输入。 |
 | `LLM_PROVIDER` | `openai` 或 `deepseek`。 |
 | `LLM_API_KEY` / `LLM_MODEL` | 对应供应商的密钥和具体模型名。模型名称由你填写，避免代码内名称过期。 |
 | `RADAR_SYNC_TOKEN` | 自己生成的随机长令牌，至少 24 字符；云端和本地须相同。可用 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成。 |
@@ -46,11 +49,11 @@ python3 -m radar run-once
 
 想验证一条旧视频，可运行 `python3 -m radar add-video VIDEO_ID`，再运行 `run-once`。它会发生字幕服务及模型调用费用。未配置密钥时，不会发起付费请求。
 
-目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`。设置字幕服务密钥后，先运行 `python3 -m radar check-channels`，确认三个链接都能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
+目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`、`@tiabtc`、`@CakeBaBa`、`@Traderfengge`。设置字幕服务密钥后，先运行 `python3 -m radar check-channels`，确认链接都能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
 
 ## 本机 Docker 验收
 
-先复制 `.env.example` 为 `.env`，填写字幕服务、模型密钥、模型名和本机 `OBSIDIAN_VAULT` 绝对路径。首次启动会把三个频道已有视频记录为基线，之后只自动分析新发布的视频。本机启动 worker 和 Obsidian 同步服务，并把同步 API 限制在本机端口：
+先复制 `.env.example` 为 `.env`，填写字幕服务、模型密钥、模型名和本机 `OBSIDIAN_VAULT` 绝对路径。首次启动会把频道已有视频记录为基线，之后只自动分析新发布的视频。本机启动 worker 和 Obsidian 同步服务，并把同步 API 限制在本机端口：
 
 ```sh
 docker compose -f compose.yaml -f compose.local.yaml up -d --build radar sync
@@ -96,7 +99,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.youtube-radar
 - 3 小时是**开始尝试取字幕**的时间，不是结果保证。YouTube 自动字幕可能延迟或一直不可用；失败会在 `python3 -m radar list` 中显示。见 [YouTube 自动字幕说明](https://support.google.com/youtube/answer/6373554)。
 - 官方 YouTube 字幕下载接口要求对视频有编辑权限，因此此工具使用第三方字幕服务；服务的覆盖率、价格与可用性需要用你指定的真实频道验证。见 [官方接口权限](https://developers.google.com/youtube/data/reference/rest/v3/captions/download)。
 - 目前记录播放量快照，但**不自动称某条视频为“爆款”**。需要积累同频道、同类型、相同发布时长的样本后才适合计算相对热度。
-- AI 分析依据字幕；视频画面中的图表、操作演示和封面之外的视觉信息暂未解析。
+- 有字幕的视频按字幕分析，尚未解析视频画面。缺字幕且启用 Gemini 回退的视频可以参考画面，但 AI 内容记录并非完整逐字字幕，图表数字与时间点需回看原视频核对。
 - 主题关联依赖模型提取的标准主题名，只把共享同一主题名的视频相连；评论是个别观众的公开发言，不代表总体意见，也未经事实核验。
 - 自动同步更新已存在的笔记时，如果检测到你在本地改过文件，会先将旧内容放进 vault 的 `.youtube-radar/backups/`，再写入新版。复盘内容建议写在单独的个人笔记，并用双链关联自动笔记。
 - 当前是可部署的命令行工具，未提供桌面图形界面。三个频道与单条视频的完整流程已在本机验证；云端部署时仍需在服务器配置密钥，并将本机同步 URL 指向云端域名。

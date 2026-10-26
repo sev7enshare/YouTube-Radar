@@ -13,7 +13,8 @@ from .config import Config
 from .db import (add_channel, connect, due_videos, finish_video, iso, processed_today,
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
-from .providers import latest_videos, parse_timestamp, public_comments, transcript, video_description
+from .providers import (latest_videos, parse_timestamp, public_comments, transcript, video_description,
+                        video_duration_seconds, video_observations)
 from .render import (image_path, note_path, published_local, render_channel_index, render_index, render_note,
                      render_topic_index, render_topic_note, render_transcript, safe_component, transcript_path,
                      topic_path)
@@ -105,15 +106,50 @@ def snapshots_for(db: sqlite3.Connection, video_id: str) -> list[sqlite3.Row]:
 
 def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now: datetime) -> None:
     video_id = row["id"]
+    source_kind = row["source_kind"] or "captions"
+    video_duration = None
     if row["transcript_json"]:
         segments = json.loads(row["transcript_json"])
         language = row["language"] or "unknown"
     else:
-        segments, language = transcript(video_id, config.transcript_api_key)
+        try:
+            segments, language = transcript(video_id, config.transcript_api_key)
+        except HttpError as exc:
+            if exc.status != 404 or '"no_captions"' not in str(exc) or not config.gemini_api_key:
+                raise
+            if config.youtube_api_key:
+                try:
+                    video_duration = video_duration_seconds(video_id, config.youtube_api_key)
+                except Exception as duration_error:
+                    log.warning("Video duration unavailable for %s: %s", video_id, duration_error)
+            segments, language = video_observations(video_id, config.gemini_api_key,
+                                                    config.gemini_video_model, video_duration)
+            if video_duration and video_duration >= 600:
+                for _ in range(3):
+                    latest = max(item["start"] for item in segments)
+                    if latest >= video_duration * 0.9:
+                        break
+                    clip_start = max(0, int(latest) - 60)
+                    clip_end = min(video_duration, clip_start + 720)
+                    if clip_end <= latest + 30:
+                        break
+                    try:
+                        more, _ = video_observations(video_id, config.gemini_api_key,
+                                                     config.gemini_video_model, video_duration,
+                                                     clip_start, clip_end)
+                    except Exception as clip_error:
+                        log.warning("Later video section unavailable for %s: %s", video_id, clip_error)
+                        break
+                    segments.extend(more)
+                    segments.sort(key=lambda item: item["start"])
+            source_kind = "gemini_video"
         with db:
-            db.execute("UPDATE videos SET transcript_json=?, language=? WHERE id=?",
-                       (json.dumps(segments, ensure_ascii=False), language, video_id))
-    analysis = analyze(config, row["title"], segments)
+            db.execute("UPDATE videos SET transcript_json=?, language=?, source_kind=? WHERE id=?",
+                       (json.dumps(segments, ensure_ascii=False), language, source_kind, video_id))
+    analysis = analyze(config, row["title"], segments, source_kind)
+    if source_kind == "gemini_video" and video_duration and max(item["start"] for item in segments) < video_duration * 0.9:
+        analysis["limits"] = (str(analysis.get("limits") or "").strip() +
+                              " AI 内容记录可能未覆盖视频结尾，请打开原视频核对。").strip()
     cover = thumbnail(video_id)
     with db:
         finish_video(db, video_id, language, json.dumps(analysis, ensure_ascii=False), now)

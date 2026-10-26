@@ -20,6 +20,8 @@ class Config:
     listen_port: int
     channels_file: Path = Path("channels.txt")
     youtube_api_key: str = ""
+    gemini_api_key: str = ""
+    gemini_video_model: str = "gemini-2.5-flash"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,6 +42,8 @@ class Config:
             listen_port=int(os.getenv("RADAR_LISTEN_PORT", "8765")),
             channels_file=Path(os.getenv("RADAR_CHANNELS_FILE", "channels.txt")),
             youtube_api_key=os.getenv("YOUTUBE_API_KEY", ""),
+            gemini_api_key=os.getenv("GEMINI_API_KEY") or os.getenv("gemini_API_KEY", ""),
+            gemini_video_model=os.getenv("GEMINI_VIDEO_MODEL", "gemini-2.5-flash"),
         )
 
     def require_worker_keys(self) -> None:

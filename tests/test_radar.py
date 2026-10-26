@@ -12,7 +12,8 @@ from unittest.mock import patch
 from radar.analysis import classify_topics, select_valuable_comments
 from radar.config import Config
 from radar.db import add_channel, add_video, artifacts_after, connect, iso, put_artifact, record_discovery, utc_now
-from radar.providers import Video, public_comments, video_description
+from radar.providers import Video, public_comments, video_description, video_duration_seconds, video_observations
+from radar.http_client import HttpError
 from radar.sync import safe_artifact_path, sync_to_vault
 from radar.worker import assign_artifact_base, enrich_analyzed, refresh_notes, run_once
 
@@ -111,6 +112,116 @@ class RadarTests(unittest.TestCase):
         self.assertIn("我的复盘", backups[0].read_text())
         with patch("radar.sync.request_json", side_effect=fake_request):
             self.assertEqual(sync_to_vault("http://127.0.0.1:8765", self.config.sync_token, vault), 0)
+
+    def test_no_captions_uses_labeled_video_observations(self) -> None:
+        config = replace(self.config, gemini_api_key="gemini-test")
+        db = connect(config.db_path)
+        add_video(db, "abcdefghijk")
+        with db:
+            db.execute("UPDATE videos SET channel_name=?, title=? WHERE id=?",
+                       ("Sample 频道", "比特币走势", "abcdefghijk"))
+        db.close()
+        observations = [{"start": 0, "text": "博主介绍本周走势。"},
+                        {"start": 35, "text": "画面出现价格图表。"},
+                        {"start": 70, "text": "博主讨论风险。"}]
+        analysis = {"summary": "本周走势分析。", "hook": "先提出问题。",
+                    "sections": [], "claims": [], "angles": [], "limits": "近似内容记录。"}
+        with patch("radar.worker.transcript", side_effect=HttpError(404, '{"code":"no_captions"}')), \
+             patch("radar.worker.video_observations", return_value=(observations, "zh")) as fallback, \
+             patch("radar.worker.video_duration_seconds", return_value=120), \
+             patch("radar.worker.analyze", return_value=analysis), \
+             patch("radar.worker.thumbnail", return_value=None), \
+             patch("radar.worker.video_description", return_value="描述区"), \
+             patch("radar.worker.classify_topics", return_value=[]):
+            counts = run_once(config)
+        self.assertEqual(counts["analyzed"], 1)
+        fallback.assert_called_once_with("abcdefghijk", "gemini-test", "gemini-2.5-flash", None)
+        db = connect(config.db_path)
+        row = db.execute("SELECT source_kind, artifact_base FROM videos WHERE id=?", ("abcdefghijk",)).fetchone()
+        note = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
+                          (row["artifact_base"] + ".md",)).fetchone()[0].decode()
+        record = db.execute("SELECT body FROM artifacts WHERE path LIKE '%/字幕/%.md' ORDER BY revision DESC LIMIT 1").fetchone()[0].decode()
+        db.close()
+        self.assertEqual(row["source_kind"], "gemini_video")
+        self.assertIn("AI 视频内容记录", note)
+        self.assertNotIn("**完整字幕：**", note)
+        self.assertIn("并非逐字字幕", record)
+
+    def test_no_captions_reads_later_video_sections(self) -> None:
+        config = replace(self.config, gemini_api_key="gemini-test", youtube_api_key="youtube-test")
+        db = connect(config.db_path)
+        add_video(db, "abcdefghijk")
+        db.close()
+        first = ([{"start": 0, "text": "片头"}, {"start": 50, "text": "背景"},
+                  {"start": 100, "text": "观点"}], "zh")
+        middle = ([{"start": 100, "text": "中段"}, {"start": 400, "text": "论据"},
+                   {"start": 700, "text": "转折"}], "zh")
+        later = ([{"start": 760, "text": "后段"}, {"start": 900, "text": "回应"},
+                  {"start": 1100, "text": "结尾"}], "zh")
+        analysis = {"summary": "摘要", "hook": "钩子", "sections": [], "claims": [],
+                    "angles": [], "limits": "近似记录"}
+        with patch("radar.worker.transcript", side_effect=HttpError(404, '{"code":"no_captions"}')), \
+             patch("radar.worker.video_duration_seconds", return_value=1200), \
+             patch("radar.worker.video_observations", side_effect=[first, middle, later]) as fallback, \
+             patch("radar.worker.analyze", return_value=analysis), \
+             patch("radar.worker.thumbnail", return_value=None), \
+             patch("radar.worker.video_description", return_value="描述区"), \
+             patch("radar.worker.classify_topics", return_value=[]), \
+             patch("radar.worker.public_comments", return_value=[]):
+            counts = run_once(config)
+        self.assertEqual(counts["analyzed"], 1)
+        self.assertEqual(fallback.call_count, 3)
+        db = connect(config.db_path)
+        timeline = json.loads(db.execute("SELECT transcript_json FROM videos WHERE id=?",
+                                         ("abcdefghijk",)).fetchone()[0])
+        db.close()
+        self.assertEqual(timeline[-1]["start"], 1100)
+
+    def test_video_observations_rejects_short_output(self) -> None:
+        response = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+            "segments": [{"start_minute": 0, "text": "一句话"}]})}]}}]}
+        with patch("radar.providers.request_json", return_value=response):
+            with self.assertRaisesRegex(ValueError, "too few"):
+                video_observations("abcdefghijk", "key", "gemini-2.5-flash")
+
+    def test_video_observations_converts_minutes_to_seconds(self) -> None:
+        response = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+            "segments": [{"start_minute": 0, "text": "开始"},
+                         {"start_minute": 1.5, "text": "中段"},
+                         {"start_minute": 3, "text": "结尾"}], "language": "zh"})}]}}]}
+        with patch("radar.providers.request_json", return_value=response):
+            segments, language = video_observations("abcdefghijk", "key", "gemini-2.5-flash")
+        self.assertEqual([item["start"] for item in segments], [0, 90, 180])
+        self.assertEqual(language, "zh")
+
+    def test_video_observations_drops_points_past_duration(self) -> None:
+        response = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+            "segments": [{"start_minute": 0, "text": "开始"},
+                         {"start_minute": 1, "text": "中段"},
+                         {"start_minute": 2, "text": "结尾"},
+                         {"start_minute": 20, "text": "超时长内容"}]})}]}}]}
+        with patch("radar.providers.request_json", return_value=response):
+            segments, _ = video_observations("abcdefghijk", "key", "gemini-2.5-flash", 180)
+        self.assertEqual(len(segments), 3)
+
+    def test_video_observations_recovers_from_malformed_json(self) -> None:
+        malformed = {"candidates": [{"content": {"parts": [{"text": '{"segments": [bad'}]}}]}
+        simple = {"candidates": [{"content": {"parts": [{"text": "0|开始\n1.5|中段\n3|结尾"}]}}]}
+        with patch("radar.providers.request_json", side_effect=[malformed, simple]):
+            segments, _ = video_observations("abcdefghijk", "key", "gemini-2.5-flash", 180)
+        self.assertEqual([item["start"] for item in segments], [0, 90, 180])
+
+    def test_video_observations_offsets_clipped_video(self) -> None:
+        response = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+            "segments": [{"start_minute": 0, "text": "片段开头"},
+                         {"start_minute": 1.5, "text": "片段中段"},
+                         {"start_minute": 3, "text": "片段结尾"}]})}]}}]}
+        with patch("radar.providers.request_json", return_value=response) as request:
+            segments, _ = video_observations("abcdefghijk", "key", "gemini-2.5-flash",
+                                             900, 600, 900)
+        self.assertEqual([item["start"] for item in segments], [600, 690, 780])
+        self.assertEqual(request.call_args.kwargs["payload"]["contents"][0]["parts"][1]["video_metadata"],
+                         {"start_offset": "600s", "end_offset": "900s"})
 
     def test_migration_keeps_edited_legacy_note(self) -> None:
         db = connect(self.config.db_path)

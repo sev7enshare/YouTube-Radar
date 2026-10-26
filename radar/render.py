@@ -73,9 +73,11 @@ def source_quote(value: str) -> list[str]:
 
 
 def render_transcript(row: sqlite3.Row, segments: list[dict[str, Any]], language: str) -> str:
-    lines = [f"# {safe_text(row['title'])} · 字幕", "",
+    generated = row["source_kind"] == "gemini_video"
+    lines = [f"# {safe_text(row['title'])} · {'AI 视频内容记录' if generated else '字幕'}", "",
              f"频道：{safe_text(row['channel_name'])}", f"来源：{link(row['id'], 0)}", f"语言：{language}", "",
-             "> [!warning] 字幕可能由语音识别生成，具体表述请回看原视频。", ""]
+             ("> [!warning] 这是 AI 根据语音和画面生成的近似内容记录，并非逐字字幕；时间点和交易数字请回看原视频。"
+              if generated else "> [!warning] 字幕可能由语音识别生成，具体表述请回看原视频。"), ""]
     for segment in segments:
         if segment["text"]:
             lines.append(f"[{stamp(float(segment['start']))}]({link(row['id'], segment['start'])}) " + safe_text(segment["text"]))
@@ -91,7 +93,7 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     topics = topics or []
     lines = ["---", f"title: {yaml_quote(title)}", f"channel: {yaml_quote(row['channel_name'])}",
              f"published: {yaml_quote(row['published_at'])}", f"video_id: {yaml_quote(video_id)}",
-             f"language: {yaml_quote(language)}", "tags: [youtube-radar]",
+             f"language: {yaml_quote(language)}", f"source_kind: {yaml_quote(row['source_kind'])}", "tags: [youtube-radar]",
              "topics: [" + ", ".join(yaml_quote(topic) for topic in topics) + "]", "---", "",
              f"# {title}", ""]
     if has_image:
@@ -99,7 +101,7 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     lines += [f"**频道：** {safe_text(row['channel_name'])}  ",
               f"**发布时间（北京时间）：** {published_local(row):%Y-%m-%d %H:%M}  ",
               f"**原视频：** [打开 YouTube]({link(video_id, 0)})  ",
-              f"**完整字幕：** [[{transcript_path(row).removesuffix('.md')}|点击查看]]", "",
+              f"**{'AI 视频内容记录' if row['source_kind'] == 'gemini_video' else '完整字幕'}：** [[{transcript_path(row).removesuffix('.md')}|点击查看]]", "",
               "## 一眼看懂", "", safe_text(analysis.get("summary")), "",
               "## 内容结构", ""]
     sections = analysis.get("sections") or []
@@ -115,7 +117,8 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
             seconds = section.get("start_seconds", 0)
             lines.append(f"- [{stamp(seconds)}]({link(video_id, seconds)}) **{safe_text(section.get('title'))}**：{safe_text(section.get('point'))}")
     else:
-        lines.append("字幕中未提取出可靠的章节时间点。")
+        lines.append("内容记录中未提取出可靠的章节时间点。" if row["source_kind"] == "gemini_video"
+                     else "字幕中未提取出可靠的章节时间点。")
     lines += ["", "## 开头钩子", "", safe_text(analysis.get("hook")), "",
               "## 关键观点与依据", ""]
     for claim in (analysis.get("claims") or [])[:15]:

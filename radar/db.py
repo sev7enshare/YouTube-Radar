@@ -43,6 +43,7 @@ def connect(path: Path) -> sqlite3.Connection:
             next_attempt_at TEXT,
             last_error TEXT,
             language TEXT,
+            source_kind TEXT NOT NULL DEFAULT 'captions',
             transcript_json TEXT,
             analysis_json TEXT,
             analyzed_at TEXT,
@@ -83,6 +84,7 @@ def connect(path: Path) -> sqlite3.Connection:
         "comments_round": "INTEGER NOT NULL DEFAULT 0",
         "comments_next_attempt_at": "TEXT",
         "comments_error": "TEXT",
+        "source_kind": "TEXT NOT NULL DEFAULT 'captions'",
     }
     for name, definition in additions.items():
         if name not in columns:

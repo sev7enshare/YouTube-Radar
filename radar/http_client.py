@@ -15,7 +15,8 @@ class HttpError(Exception):
 
 
 def request_json(url: str, *, method: str = "GET", token: str = "", payload: dict[str, Any] | None = None,
-                 params: dict[str, str] | None = None, timeout: int = 45) -> dict[str, Any]:
+                 params: dict[str, str] | None = None, timeout: int = 45,
+                 extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
@@ -24,6 +25,8 @@ def request_json(url: str, *, method: str = "GET", token: str = "", payload: dic
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:

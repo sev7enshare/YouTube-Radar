@@ -76,20 +76,25 @@ def _call_llm(config: Config, prompt: str, instructions: str = INSTRUCTIONS) -> 
     return parsed
 
 
-def analyze(config: Config, title: str, segments: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze(config: Config, title: str, segments: list[dict[str, Any]],
+            source_kind: str = "captions") -> dict[str, Any]:
     lines = transcript_lines(segments)
     pieces = chunks(lines)
     if not pieces:
         raise ValueError("Empty transcript")
+    label = "AI 视频内容记录（非逐字字幕，时间点近似）" if source_kind == "gemini_video" else "字幕"
+    instructions = (INSTRUCTIONS.replace("别人的视频字幕", "别人的 AI 视频内容记录")
+                    .replace("提供的字幕", "提供的内容记录")
+                    if source_kind == "gemini_video" else INSTRUCTIONS)
     if len(pieces) == 1:
-        result = _call_llm(config, f"视频标题：{title}\n\n字幕：\n{pieces[0]}")
+        result = _call_llm(config, f"视频标题：{title}\n\n{label}：\n{pieces[0]}", instructions)
     else:
-        partials = [_call_llm(config, f"视频标题：{title}\n这是第 {i + 1}/{len(pieces)} 段字幕。"
-                              f"只分析这一段，并在 limits 指明这是局部分析。\n\n字幕：\n{piece}")
+        partials = [_call_llm(config, f"视频标题：{title}\n这是第 {i + 1}/{len(pieces)} 段{label}。"
+                              f"只分析这一段，并在 limits 指明这是局部分析。\n\n{label}：\n{piece}", instructions)
                     for i, piece in enumerate(pieces)]
         result = _call_llm(config, "请把以下分段研究合并为整条视频的研究笔记。"
                            "只使用这些分段已有的信息；如果缺少画面信息，在 limits 说明。\n\n"
-                           + json.dumps(partials, ensure_ascii=False))
+                           + json.dumps(partials, ensure_ascii=False), instructions)
     for key in ("summary", "hook", "sections", "claims", "angles", "limits"):
         if key not in result:
             raise ValueError(f"Model response lacks {key}")
@@ -110,6 +115,9 @@ def analyze(config: Config, title: str, segments: list[dict[str, Any]]) -> dict[
         result[field] = retained
     if not isinstance(result.get("angles"), list):
         result["angles"] = []
+    if source_kind == "gemini_video":
+        caveat = "此笔记依据 AI 对视频语音与画面的近似内容记录生成，并非逐字字幕；时间点及交易数字须回看原视频核对。"
+        result["limits"] = (str(result.get("limits") or "").strip() + " " + caveat).strip()
     return result
 
 
