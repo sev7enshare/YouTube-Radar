@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
-import urllib.request
 from hashlib import sha256
 from datetime import datetime, timedelta
 
@@ -15,12 +13,24 @@ from .db import (add_channel, connect, due_videos, finish_video, iso, processed_
 from .http_client import HttpError
 from .providers import (latest_videos, parse_timestamp, public_comments, transcript, video_description,
                         video_duration_seconds, video_observations)
-from .render import (image_path, note_path, published_local, render_channel_index, render_index, render_note,
+from .render import (note_path, published_local, render_channel_index, render_index, render_note,
                      render_topic_index, render_topic_note, render_transcript, safe_component, transcript_path,
                      topic_path)
 
 
 log = logging.getLogger(__name__)
+
+NO_TOPIC_CHANNEL_URLS = (
+    "https://www.youtube.com/@tiabtc",
+    "https://www.youtube.com/@CakeBaBa",
+    "https://www.youtube.com/@Traderfengge",
+)
+
+
+def no_topic_channel_ids(db: sqlite3.Connection) -> set[int]:
+    placeholders = ",".join("?" for _ in NO_TOPIC_CHANNEL_URLS)
+    return {row["id"] for row in db.execute(
+        f"SELECT id FROM channels WHERE url IN ({placeholders})", NO_TOPIC_CHANNEL_URLS)}
 
 
 def channel_folder(db: sqlite3.Connection, channel_id: int, channel_name: str) -> str:
@@ -58,14 +68,24 @@ def retire_artifact(db: sqlite3.Connection, path: str, now: datetime) -> None:
                      "application/x-youtube-radar-delete", now)
 
 
+def retire_generated_covers(db: sqlite3.Connection, now: datetime) -> int:
+    """Send image removals to synced vaults, then discard stored JPEG bodies."""
+    paths = [row[0] for row in db.execute("SELECT DISTINCT path FROM artifacts WHERE mime='image/jpeg'")]
+    if not paths:
+        return 0
+    with db:
+        for path in paths:
+            retire_artifact(db, path, now)
+        db.execute("DELETE FROM artifacts WHERE mime='image/jpeg'")
+    return len(paths)
+
+
 def migrate_legacy_artifacts(db: sqlite3.Connection, now: datetime) -> None:
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NULL").fetchall()
     for row in rows:
         old_note = f"YouTube Radar/notes/{parse_timestamp(row['published_at']).date().isoformat()}-{row['id']}.md"
         old_transcript = f"YouTube Radar/transcripts/{row['id']}.md"
         old_image = f"YouTube Radar/assets/{row['id']}.jpg"
-        cover = db.execute("SELECT body FROM artifacts WHERE path=? AND mime='image/jpeg' ORDER BY revision DESC LIMIT 1",
-                           (old_image,)).fetchone()
         with db:
             assign_artifact_base(db, row)
             fresh = db.execute("SELECT * FROM videos WHERE id=?", (row["id"],)).fetchone()
@@ -73,31 +93,12 @@ def migrate_legacy_artifacts(db: sqlite3.Connection, now: datetime) -> None:
             analysis = json.loads(row["analysis_json"])
             put_artifact(db, transcript_path(fresh), render_transcript(fresh, segments, row["language"]).encode(),
                          "text/markdown", now)
-            if cover:
-                put_artifact(db, image_path(fresh), cover["body"], "image/jpeg", now)
-            note = render_note(fresh, analysis, row["language"], bool(cover), snapshots_for(db, row["id"]))
+            note = render_note(fresh, analysis, row["language"], snapshots_for(db, row["id"]),
+                               include_topics=row["channel_ref"] not in no_topic_channel_ids(db))
             put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
             for path in (old_note, old_transcript, old_image):
                 retire_artifact(db, path, now)
         log.info("Moved note into channel folder for %s", row["id"])
-
-
-def thumbnail(video_id: str) -> bytes | None:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-        return None
-    request = urllib.request.Request(
-        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-        headers={"User-Agent": "YouTubeRadar/0.1"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            if "image/jpeg" not in response.headers.get("Content-Type", ""):
-                return None
-            body = response.read(2_000_001)
-            return body if len(body) <= 2_000_000 else None
-    except Exception as exc:
-        log.warning("Thumbnail unavailable for %s: %s", video_id, exc)
-        return None
 
 
 def snapshots_for(db: sqlite3.Connection, video_id: str) -> list[sqlite3.Row]:
@@ -150,16 +151,14 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
     if source_kind == "gemini_video" and video_duration and max(item["start"] for item in segments) < video_duration * 0.9:
         analysis["limits"] = (str(analysis.get("limits") or "").strip() +
                               " AI 内容记录可能未覆盖视频结尾，请打开原视频核对。").strip()
-    cover = thumbnail(video_id)
     with db:
         finish_video(db, video_id, language, json.dumps(analysis, ensure_ascii=False), now)
         assign_artifact_base(db, row)
         fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
         put_artifact(db, transcript_path(fresh),
                      render_transcript(fresh, segments, language).encode(), "text/markdown", now)
-        if cover:
-            put_artifact(db, image_path(fresh), cover, "image/jpeg", now)
-        note = render_note(fresh, analysis, language, bool(cover), snapshots_for(db, video_id))
+        note = render_note(fresh, analysis, language, snapshots_for(db, video_id),
+                           include_topics=row["channel_ref"] not in no_topic_channel_ids(db))
         put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
     log.info("Analyzed %s", video_id)
 
@@ -168,9 +167,10 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
     """Fill optional sources independently so outages never discard the core analysis."""
     counts = {"descriptions": 0, "topics": 0, "comments": 0}
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' ORDER BY published_at").fetchall()
+    no_topics = no_topic_channel_ids(db)
     catalog: list[str] = []
     for row in rows:
-        if row["topics_json"]:
+        if row["channel_ref"] not in no_topics and row["topics_json"]:
             for name in json.loads(row["topics_json"]):
                 if name not in catalog:
                     catalog.append(name)
@@ -191,7 +191,7 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
                                (iso(now + timedelta(hours=1)), video_id))
                 log.warning("Description fetch deferred for %s: %s", video_id, exc)
         fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
-        if fresh["topics_json"] is None and (not fresh["topics_next_attempt_at"] or
+        if fresh["channel_ref"] not in no_topics and fresh["topics_json"] is None and (not fresh["topics_next_attempt_at"] or
                                               fresh["topics_next_attempt_at"] <= iso(now)):
             try:
                 analysis = json.loads(fresh["analysis_json"])
@@ -242,7 +242,9 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
 
 def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False) -> None:
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NOT NULL").fetchall()
-    topics_by_id = {row["id"]: json.loads(row["topics_json"] or "[]") for row in rows}
+    no_topics = no_topic_channel_ids(db)
+    topics_by_id = {row["id"]: (json.loads(row["topics_json"] or "[]")
+                                if row["channel_ref"] not in no_topics else []) for row in rows}
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         for name in topics_by_id[row["id"]]:
@@ -253,8 +255,6 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
                                   (row["note_refreshed_at"] and
                                    row["note_refreshed_at"] >= iso(now - timedelta(hours=3)))):
                 continue
-            has_image = db.execute("SELECT 1 FROM artifacts WHERE path=? AND mime='image/jpeg' LIMIT 1",
-                                   (image_path(row),)).fetchone() is not None
             own_topics = topics_by_id[row["id"]]
             related = []
             for other in rows:
@@ -265,13 +265,20 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
                     related.append((note_path(other), other["title"], shared))
             related.sort(key=lambda item: item[0], reverse=True)
             comments = json.loads(row["comments_json"]) if row["comments_json"] is not None else None
-            note = render_note(row, json.loads(row["analysis_json"]), row["language"], has_image,
-                               snapshots_for(db, row["id"]), own_topics, related, comments)
+            note = render_note(row, json.loads(row["analysis_json"]), row["language"],
+                               snapshots_for(db, row["id"]), own_topics, related, comments,
+                               include_topics=row["channel_ref"] not in no_topics)
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
         put_artifact(db, "YouTube Radar/主题索引.md", render_topic_index(groups).encode(), "text/markdown", now)
         for name, videos in groups.items():
             put_artifact(db, topic_path(name), render_topic_note(name, videos).encode(), "text/markdown", now)
+        active_paths = {topic_path(name) for name in groups}
+        stale_paths = [row[0] for row in db.execute(
+            "SELECT DISTINCT path FROM artifacts WHERE path LIKE 'YouTube Radar/主题/%.md' AND mime='text/markdown'")]
+        for path in stale_paths:
+            if path not in active_paths:
+                retire_artifact(db, path, now)
 
 
 def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
@@ -290,10 +297,11 @@ def run_once(config: Config) -> dict[str, int]:
     config.require_worker_keys()
     db = connect(config.db_path)
     now = utc_now()
-    counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0,
+    counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0, "covers_removed": 0,
               "descriptions": 0, "topics": 0, "comments": 0}
     try:
         migrate_legacy_artifacts(db, now)
+        counts["covers_removed"] = retire_generated_covers(db, now)
         if config.channels_file.exists():
             for line in config.channels_file.read_text(encoding="utf-8").splitlines():
                 value = line.strip()
@@ -329,7 +337,7 @@ def run_once(config: Config) -> dict[str, int]:
                 log.exception("Analysis failed for %s", row["id"])
         counts.update(enrich_analyzed(db, config, now))
         refresh_notes(db, now, force_all=any(counts[key] for key in
-                      ("analyzed", "descriptions", "topics", "comments")))
+                      ("analyzed", "descriptions", "topics", "comments", "covers_removed")))
         refresh_channel_indexes(db, now)
         recent = db.execute("""SELECT * FROM videos WHERE status!='ignored' AND published_at>=?
             ORDER BY published_at DESC LIMIT 100""", (iso(now - timedelta(days=7)),)).fetchall()

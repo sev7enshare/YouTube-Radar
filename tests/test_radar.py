@@ -63,7 +63,6 @@ class RadarTests(unittest.TestCase):
         segments = [{"start": 0.0, "text": "这是一个测试字幕。"}]
         with patch("radar.worker.transcript", return_value=(segments, "zh")), \
              patch("radar.worker.analyze", return_value=analysis), \
-             patch("radar.worker.thumbnail", return_value=b"fake-jpeg"), \
              patch("radar.worker.video_description", return_value="描述区原文：测试链接"), \
              patch("radar.worker.classify_topics", return_value=["加密货币走势"]):
             counts = run_once(self.config)
@@ -93,8 +92,8 @@ class RadarTests(unittest.TestCase):
         self.assertIn("Sample 频道", text)
         self.assertIn("描述区原文：测试链接", text)
         self.assertIn("[[YouTube Radar/主题/加密货币走势|加密货币走势]]", text)
-        self.assertIn(f"![[YouTube Radar/Sample 频道/封面/{notes[0].stem}.jpg]]", text)
-        self.assertTrue((channel / "封面" / (notes[0].stem + ".jpg")).exists())
+        self.assertNotIn("/封面/", text)
+        self.assertFalse((channel / "封面").exists())
         self.assertTrue((channel / "字幕" / (notes[0].stem + ".md")).exists())
         self.assertIn(f"[[YouTube Radar/Sample 频道/{notes[0].stem}\\|",
                       (vault / "YouTube Radar/最近视频.md").read_text())
@@ -130,7 +129,6 @@ class RadarTests(unittest.TestCase):
              patch("radar.worker.video_observations", return_value=(observations, "zh")) as fallback, \
              patch("radar.worker.video_duration_seconds", return_value=120), \
              patch("radar.worker.analyze", return_value=analysis), \
-             patch("radar.worker.thumbnail", return_value=None), \
              patch("radar.worker.video_description", return_value="描述区"), \
              patch("radar.worker.classify_topics", return_value=[]):
             counts = run_once(config)
@@ -164,7 +162,6 @@ class RadarTests(unittest.TestCase):
              patch("radar.worker.video_duration_seconds", return_value=1200), \
              patch("radar.worker.video_observations", side_effect=[first, middle, later]) as fallback, \
              patch("radar.worker.analyze", return_value=analysis), \
-             patch("radar.worker.thumbnail", return_value=None), \
              patch("radar.worker.video_description", return_value="描述区"), \
              patch("radar.worker.classify_topics", return_value=[]), \
              patch("radar.worker.public_comments", return_value=[]):
@@ -339,6 +336,44 @@ class RadarTests(unittest.TestCase):
         index = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
                            ("YouTube Radar/主题索引.md",)).fetchone()["body"].decode()
         self.assertIn("AI订阅支付", index)
+        db.close()
+
+    def test_crypto_channels_have_no_topic_section_or_cross_links(self) -> None:
+        db = connect(self.config.db_path)
+        now = utc_now()
+        analysis = {"summary": "行情观点", "hook": "", "sections": [], "claims": [],
+                    "angles": [], "limits": "以发布日期为准"}
+        cases = (("abcdefghijk", "https://www.youtube.com/@tiabtc", "行情频道"),
+                 ("123456789ab", "https://www.youtube.com/@sample", "普通频道"))
+        for video_id, url, name in cases:
+            add_video(db, video_id, url)
+            with db:
+                db.execute("""UPDATE videos SET status='analyzed', channel_name=?, title=?,
+                    analysis_json=?, language='zh', published_at=?, analyzed_at=?, topics_json=? WHERE id=?""",
+                    (name, name + "的比特币走势", json.dumps(analysis, ensure_ascii=False),
+                     iso(now - timedelta(days=2)), iso(now), '["比特币走势"]', video_id))
+                assign_artifact_base(db, db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone())
+        refresh_notes(db, now, force_all=True)
+        bodies = {}
+        for video_id, _, _ in cases:
+            path = db.execute("SELECT artifact_base FROM videos WHERE id=?", (video_id,)).fetchone()[0] + ".md"
+            bodies[video_id] = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
+                                          (path,)).fetchone()[0].decode()
+        self.assertNotIn("## 主题与相关视频", bodies["abcdefghijk"])
+        self.assertIn("topics: []", bodies["abcdefghijk"])
+        self.assertIn("## 主题与相关视频", bodies["123456789ab"])
+        self.assertNotIn("行情频道", bodies["123456789ab"])
+        topic_path = "YouTube Radar/主题/比特币走势.md"
+        topic_note = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
+                                (topic_path,)).fetchone()[0].decode()
+        self.assertIn("普通频道", topic_note)
+        self.assertNotIn("行情频道", topic_note)
+        with db:
+            db.execute("UPDATE videos SET topics_json=NULL WHERE id=?", ("abcdefghijk",))
+        with patch("radar.worker.video_description", return_value=""), \
+             patch("radar.worker.classify_topics", side_effect=AssertionError("Crypto topic model should not run")):
+            counts = enrich_analyzed(db, self.config, now)
+        self.assertEqual(counts["topics"], 0)
         db.close()
 
     def test_youtube_metadata_and_comment_sampling(self) -> None:

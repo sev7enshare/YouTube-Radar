@@ -56,12 +56,6 @@ def transcript_path(row: sqlite3.Row) -> str:
     return f"{folder}/字幕/{stem}.md"
 
 
-def image_path(row: sqlite3.Row) -> str:
-    base = artifact_base(row)
-    folder, stem = base.rsplit("/", 1)
-    return f"{folder}/封面/{stem}.jpg"
-
-
 def topic_path(name: str) -> str:
     return f"YouTube Radar/主题/{safe_component(name, 72)}.md"
 
@@ -85,9 +79,10 @@ def render_transcript(row: sqlite3.Row, segments: list[dict[str, Any]], language
 
 
 def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
-                has_image: bool, snapshots: list[sqlite3.Row], topics: list[str] | None = None,
+                snapshots: list[sqlite3.Row], topics: list[str] | None = None,
                 related: list[tuple[str, str, list[str]]] | None = None,
-                comments: list[dict[str, Any]] | None = None) -> str:
+                comments: list[dict[str, Any]] | None = None,
+                include_topics: bool = True) -> str:
     video_id = row["id"]
     title = safe_text(row["title"])
     topics = topics or []
@@ -96,8 +91,6 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
              f"language: {yaml_quote(language)}", f"source_kind: {yaml_quote(row['source_kind'])}", "tags: [youtube-radar]",
              "topics: [" + ", ".join(yaml_quote(topic) for topic in topics) + "]", "---", "",
              f"# {title}", ""]
-    if has_image:
-        lines += [f"![[{image_path(row)}]]", ""]
     lines += [f"**频道：** {safe_text(row['channel_name'])}  ",
               f"**发布时间（北京时间）：** {published_local(row):%Y-%m-%d %H:%M}  ",
               f"**原视频：** [打开 YouTube]({link(video_id, 0)})  ",
@@ -127,16 +120,17 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     lines += ["", "## 我的差异化选题机会", ""]
     for angle in (analysis.get("angles") or [])[:8]:
         lines.append(f"- **{safe_text(angle.get('idea'))}**：{safe_text(angle.get('why'))}")
-    lines += ["", "## 主题与相关视频", ""]
-    if topics:
-        lines.append("主题：" + " · ".join(
-            f"[[{topic_path(name).removesuffix('.md')}|{name}]]" for name in topics))
-    else:
-        lines.append("尚未完成主题分类。")
-    for path, other_title, shared in (related or [])[:12]:
-        lines.append(f"- [[{path.removesuffix('.md')}|{other_title}]] · 共同主题：{'、'.join(shared)}")
-    if not related:
-        lines.append("暂无已收录的同主题视频。")
+    if include_topics:
+        lines += ["", "## 主题与相关视频", ""]
+        if topics:
+            lines.append("主题：" + " · ".join(
+                f"[[{topic_path(name).removesuffix('.md')}|{name}]]" for name in topics))
+        else:
+            lines.append("尚未完成主题分类。")
+        for path, other_title, shared in (related or [])[:12]:
+            lines.append(f"- [[{path.removesuffix('.md')}|{other_title}]] · 共同主题：{'、'.join(shared)}")
+        if not related:
+            lines.append("暂无已收录的同主题视频。")
     lines += ["", "## 视频描述区原文", ""]
     description = str(row["description"] or "").strip()
     lines += source_quote(description) if description else ["尚未取得描述区内容。"]
