@@ -6,7 +6,7 @@ import sqlite3
 from hashlib import sha256
 from datetime import datetime, timedelta
 
-from .analysis import analyze, classify_topics, select_valuable_comments
+from .analysis import analyze, classify_topics, extract_market_view, select_valuable_comments
 from .config import Config
 from .db import (add_channel, connect, due_videos, finish_video, iso, processed_today,
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
@@ -20,17 +20,20 @@ from .render import (note_path, published_local, render_channel_index, render_in
 
 log = logging.getLogger(__name__)
 
-NO_TOPIC_CHANNEL_URLS = (
-    "https://www.youtube.com/@tiabtc",
-    "https://www.youtube.com/@CakeBaBa",
-    "https://www.youtube.com/@Traderfengge",
-)
+def market_channel_ids(db: sqlite3.Connection) -> set[int]:
+    return {row["id"] for row in db.execute("SELECT id FROM channels WHERE mode='market'")}
 
 
-def no_topic_channel_ids(db: sqlite3.Connection) -> set[int]:
-    placeholders = ",".join("?" for _ in NO_TOPIC_CHANNEL_URLS)
-    return {row["id"] for row in db.execute(
-        f"SELECT id FROM channels WHERE url IN ({placeholders})", NO_TOPIC_CHANNEL_URLS)}
+def import_channel_files(db: sqlite3.Connection, config: Config) -> None:
+    for file, mode in ((config.channels_file, "creator"), (config.market_channels_file, "market")):
+        if not file.exists():
+            continue
+        for line in file.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if value and not value.startswith("#"):
+                add_channel(db, value)
+                with db:
+                    db.execute("UPDATE channels SET mode=? WHERE url=?", (mode, value))
 
 
 def channel_folder(db: sqlite3.Connection, channel_id: int, channel_name: str) -> str:
@@ -94,7 +97,8 @@ def migrate_legacy_artifacts(db: sqlite3.Connection, now: datetime) -> None:
             put_artifact(db, transcript_path(fresh), render_transcript(fresh, segments, row["language"]).encode(),
                          "text/markdown", now)
             note = render_note(fresh, analysis, row["language"], snapshots_for(db, row["id"]),
-                               include_topics=row["channel_ref"] not in no_topic_channel_ids(db))
+                               include_topics=row["channel_ref"] not in market_channel_ids(db),
+                               market_mode=row["channel_ref"] in market_channel_ids(db))
             put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
             for path in (old_note, old_transcript, old_image):
                 retire_artifact(db, path, now)
@@ -148,6 +152,9 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
             db.execute("UPDATE videos SET transcript_json=?, language=?, source_kind=? WHERE id=?",
                        (json.dumps(segments, ensure_ascii=False), language, source_kind, video_id))
     analysis = analyze(config, row["title"], segments, source_kind)
+    is_market = row["channel_ref"] in market_channel_ids(db)
+    if is_market:
+        analysis["market_view"] = extract_market_view(config, row["title"], segments, source_kind)
     if source_kind == "gemini_video" and video_duration and max(item["start"] for item in segments) < video_duration * 0.9:
         analysis["limits"] = (str(analysis.get("limits") or "").strip() +
                               " AI 内容记录可能未覆盖视频结尾，请打开原视频核对。").strip()
@@ -158,7 +165,7 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
         put_artifact(db, transcript_path(fresh),
                      render_transcript(fresh, segments, language).encode(), "text/markdown", now)
         note = render_note(fresh, analysis, language, snapshots_for(db, video_id),
-                           include_topics=row["channel_ref"] not in no_topic_channel_ids(db))
+                           include_topics=not is_market, market_mode=is_market)
         put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
     log.info("Analyzed %s", video_id)
 
@@ -167,7 +174,7 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
     """Fill optional sources independently so outages never discard the core analysis."""
     counts = {"descriptions": 0, "topics": 0, "comments": 0}
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' ORDER BY published_at").fetchall()
-    no_topics = no_topic_channel_ids(db)
+    no_topics = market_channel_ids(db)
     catalog: list[str] = []
     for row in rows:
         if row["channel_ref"] not in no_topics and row["topics_json"]:
@@ -209,7 +216,7 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
                     db.execute("UPDATE videos SET topics_next_attempt_at=? WHERE id=?",
                                (iso(now + timedelta(hours=1)), video_id))
                 log.warning("Topic classification deferred for %s: %s", video_id, exc)
-        if not config.youtube_api_key:
+        if not config.youtube_api_key or fresh["channel_ref"] in no_topics:
             continue
         fresh = db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
         due_second = fresh["comments_round"] == 1 and now >= parse_timestamp(fresh["published_at"]) + timedelta(hours=24)
@@ -242,7 +249,7 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
 
 def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False) -> None:
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NOT NULL").fetchall()
-    no_topics = no_topic_channel_ids(db)
+    no_topics = market_channel_ids(db)
     topics_by_id = {row["id"]: (json.loads(row["topics_json"] or "[]")
                                 if row["channel_ref"] not in no_topics else []) for row in rows}
     groups: dict[str, list[sqlite3.Row]] = {}
@@ -267,7 +274,8 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
             comments = json.loads(row["comments_json"]) if row["comments_json"] is not None else None
             note = render_note(row, json.loads(row["analysis_json"]), row["language"],
                                snapshots_for(db, row["id"]), own_topics, related, comments,
-                               include_topics=row["channel_ref"] not in no_topics)
+                               include_topics=row["channel_ref"] not in no_topics,
+                               market_mode=row["channel_ref"] in no_topics)
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
         put_artifact(db, "YouTube Radar/主题索引.md", render_topic_index(groups).encode(), "text/markdown", now)
@@ -293,6 +301,36 @@ def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
                          "text/markdown", now)
 
 
+def backfill_market_views(config: Config) -> tuple[int, int]:
+    """Re-read stored source text; never spend transcript credits on existing videos."""
+    db = connect(config.db_path)
+    completed = failed = 0
+    try:
+        import_channel_files(db, config)
+        rows = db.execute("""SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_ref
+            WHERE c.mode='market' AND v.status='analyzed' AND v.transcript_json IS NOT NULL
+            ORDER BY v.published_at DESC""").fetchall()
+        for row in rows:
+            analysis = json.loads(row["analysis_json"])
+            if analysis.get("market_view"):
+                continue
+            try:
+                analysis["market_view"] = extract_market_view(
+                    config, row["title"], json.loads(row["transcript_json"]), row["source_kind"])
+                with db:
+                    db.execute("UPDATE videos SET analysis_json=? WHERE id=?",
+                               (json.dumps(analysis, ensure_ascii=False), row["id"]))
+                completed += 1
+                log.info("Market view extracted for %s", row["id"])
+            except Exception:
+                failed += 1
+                log.exception("Market view extraction failed for %s", row["id"])
+        refresh_notes(db, utc_now(), force_all=True)
+        return completed, failed
+    finally:
+        db.close()
+
+
 def run_once(config: Config) -> dict[str, int]:
     config.require_worker_keys()
     db = connect(config.db_path)
@@ -300,13 +338,9 @@ def run_once(config: Config) -> dict[str, int]:
     counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0, "covers_removed": 0,
               "descriptions": 0, "topics": 0, "comments": 0}
     try:
+        import_channel_files(db, config)
         migrate_legacy_artifacts(db, now)
         counts["covers_removed"] = retire_generated_covers(db, now)
-        if config.channels_file.exists():
-            for line in config.channels_file.read_text(encoding="utf-8").splitlines():
-                value = line.strip()
-                if value and not value.startswith("#"):
-                    add_channel(db, value)
         channels = db.execute("SELECT * FROM channels WHERE url!='@manual' ORDER BY id").fetchall()
         for channel in channels:
             try:

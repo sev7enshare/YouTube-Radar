@@ -82,7 +82,7 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
                 snapshots: list[sqlite3.Row], topics: list[str] | None = None,
                 related: list[tuple[str, str, list[str]]] | None = None,
                 comments: list[dict[str, Any]] | None = None,
-                include_topics: bool = True) -> str:
+                include_topics: bool = True, market_mode: bool = False) -> str:
     video_id = row["id"]
     title = safe_text(row["title"])
     topics = topics or []
@@ -95,8 +95,42 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
               f"**发布时间（北京时间）：** {published_local(row):%Y-%m-%d %H:%M}  ",
               f"**原视频：** [打开 YouTube]({link(video_id, 0)})  ",
               f"**{'AI 视频内容记录' if row['source_kind'] == 'gemini_video' else '完整字幕'}：** [[{transcript_path(row).removesuffix('.md')}|点击查看]]", "",
-              "## 一眼看懂", "", safe_text(analysis.get("summary")), "",
-              "## 内容结构", ""]
+              "## 一眼看懂", "", safe_text(analysis.get("summary")), ""]
+    if market_mode:
+        view = analysis.get("market_view") or {}
+        lines += ["## 本期市场观点", "", "> [!warning] 以下是模型对博主观点的归纳，并非事实核验或交易建议。" +
+                  safe_text(view.get("source_warning") or "观点提取尚未完成；交易前核对原视频和实时行情。"), ""]
+        positions = view.get("positions") or []
+        if positions:
+            overview = "；".join(
+                f"{safe_text(item.get('asset'))}（{safe_text(item.get('horizon'))}）："
+                f"{safe_text(item.get('view')).rstrip('。；; ')}" for item in positions[:3])
+            lines += ["**核心判断：** " + overview[:500], ""]
+        for item in positions:
+            lines += [f"### {safe_text(item.get('asset'))} · {safe_text(item.get('stance'))}", "",
+                      f"- 时间范围：{safe_text(item.get('horizon')) or '未明确'}",
+                      f"- 博主观点：{safe_text(item.get('view'))}"]
+            if item.get("condition") and item["condition"] not in ("未明确", "未提及", "无"):
+                lines.append(f"- 成立条件：{safe_text(item['condition'])}")
+            if item.get("invalidation") and item["invalidation"] not in ("未明确", "未提及", "无"):
+                lines.append(f"- 失效条件：{safe_text(item['invalidation'])}")
+            for source in item.get("sources") or []:
+                seconds = source["start_seconds"]
+                lines.append(f"- [原视频 {stamp(seconds)}]({link(video_id, seconds)})：{safe_text(source['text'])}")
+            lines.append("")
+        if view.get("levels"):
+            lines += ["### 博主提及的价位", ""]
+            for item in view["levels"]:
+                sources = item.get("sources") or []
+                if sources:
+                    seconds = sources[0]["start_seconds"]
+                    lines.append(f"- {safe_text(item.get('asset'))} · {safe_text(item.get('role'))} "
+                                 f"**{safe_text(item.get('value'))}** · [核对原视频 {stamp(seconds)}]({link(video_id, seconds)})"
+                                 f"：{safe_text(sources[0]['text'])}")
+            lines.append("")
+        if not view.get("positions"):
+            lines += ["未从现有内容记录中提取出可定位的市场判断。", ""]
+    lines += ["## 内容结构", ""]
     sections = analysis.get("sections") or []
     if sections:
         lines += ["```mermaid", "flowchart TD"]
@@ -117,9 +151,10 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     for claim in (analysis.get("claims") or [])[:15]:
         seconds = claim.get("start_seconds", 0)
         lines.append(f"- [{stamp(seconds)}]({link(video_id, seconds)}) **{safe_text(claim.get('claim'))}**：{safe_text(claim.get('evidence'))}")
-    lines += ["", "## 我的差异化选题机会", ""]
-    for angle in (analysis.get("angles") or [])[:8]:
-        lines.append(f"- **{safe_text(angle.get('idea'))}**：{safe_text(angle.get('why'))}")
+    if not market_mode:
+        lines += ["", "## 我的差异化选题机会", ""]
+        for angle in (analysis.get("angles") or [])[:8]:
+            lines.append(f"- **{safe_text(angle.get('idea'))}**：{safe_text(angle.get('why'))}")
     if include_topics:
         lines += ["", "## 主题与相关视频", ""]
         if topics:
@@ -134,25 +169,26 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     lines += ["", "## 视频描述区原文", ""]
     description = str(row["description"] or "").strip()
     lines += source_quote(description) if description else ["尚未取得描述区内容。"]
-    lines += ["", "## 观众评论 · 精选", ""]
-    if comments is None:
-        lines.append("尚未采集评论；需要启用 YouTube Data API v3。")
-    elif not comments:
-        lines.append("暂无可用的公开评论。")
-    else:
-        lines.append("评论反映个别观众体验，不代表全部观众；原文可能随后被作者修改或删除。")
-        for item in comments[:10]:
-            url = f"https://www.youtube.com/watch?v={video_id}&lc={quote(str(item['id']), safe='')}"
-            category = safe_text(item.get("category"))
-            lines += ["", f"### [{category} · {int(item.get('likes') or 0)} 赞]({url})", ""]
-            lines += source_quote(str(item.get("text") or ""))
-            if item.get("why"):
-                lines.append(f"筛选原因：{safe_text(item['why'])}")
-    lines += ["", "## 播放数据快照", "", "| 采集时间 UTC | 播放量 |", "|---|---:|"]
-    for snapshot in snapshots[-20:]:
-        lines.append(f"| {snapshot['captured_at']} | {snapshot['view_count']:,} |")
-    lines += ["", "> [!note] 热度判断", "> 播放量需与同频道、同视频类型、相同发布时长的数据比较。积累足够同期快照后再给出相对热度。", "",
-              "## 资料局限", "", safe_text(analysis.get("limits")) or "仅依据字幕，未核验画面内容。", ""]
+    if not market_mode:
+        lines += ["", "## 观众评论 · 精选", ""]
+        if comments is None:
+            lines.append("尚未采集评论；需要启用 YouTube Data API v3。")
+        elif not comments:
+            lines.append("暂无可用的公开评论。")
+        else:
+            lines.append("评论反映个别观众体验，不代表全部观众；原文可能随后被作者修改或删除。")
+            for item in comments[:10]:
+                url = f"https://www.youtube.com/watch?v={video_id}&lc={quote(str(item['id']), safe='')}"
+                category = safe_text(item.get("category"))
+                lines += ["", f"### [{category} · {int(item.get('likes') or 0)} 赞]({url})", ""]
+                lines += source_quote(str(item.get("text") or ""))
+                if item.get("why"):
+                    lines.append(f"筛选原因：{safe_text(item['why'])}")
+        lines += ["", "## 播放数据快照", "", "| 采集时间 UTC | 播放量 |", "|---|---:|"]
+        for snapshot in snapshots[-20:]:
+            lines.append(f"| {snapshot['captured_at']} | {snapshot['view_count']:,} |")
+        lines += ["", "> [!note] 热度判断", "> 播放量需与同频道、同视频类型、相同发布时长的数据比较。积累足够同期快照后再给出相对热度。", ""]
+    lines += ["", "## 资料局限", "", safe_text(analysis.get("limits")) or "仅依据字幕，未核验画面内容。", ""]
     return "\n".join(lines)
 
 

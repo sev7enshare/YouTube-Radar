@@ -28,7 +28,8 @@ def connect(path: Path) -> sqlite3.Connection:
             added_at TEXT NOT NULL,
             name TEXT,
             last_checked_at TEXT,
-            last_error TEXT
+            last_error TEXT,
+            mode TEXT NOT NULL DEFAULT 'creator'
         );
         CREATE TABLE IF NOT EXISTS videos (
             id TEXT PRIMARY KEY,
@@ -74,6 +75,9 @@ def connect(path: Path) -> sqlite3.Connection:
         );
     """)
     columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
+    channel_columns = {row[1] for row in db.execute("PRAGMA table_info(channels)")}
+    if "mode" not in channel_columns:
+        db.execute("ALTER TABLE channels ADD COLUMN mode TEXT NOT NULL DEFAULT 'creator'")
     additions = {
         "artifact_base": "TEXT",
         "metadata_checked_at": "TEXT",

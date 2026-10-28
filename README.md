@@ -5,11 +5,11 @@
 ## 当前能力
 
 - 每 15 分钟检查频道最近 15 条视频；首次加入时只将已有视频作为基线，不付费回溯分析。
-- 视频达到设定年龄后取字幕，按完整字幕拆解观点、结构、钩子和差异化选题。长视频分段处理。
+- 视频达到设定年龄后取字幕。普通创作者频道按完整字幕拆解观点、结构、钩子和差异化选题；市场跟踪频道额外提取博主对各资产、时间范围、条件及失效条件的判断，并附原视频时间点。长视频分段处理。
 - 视频没有 YouTube 字幕且配置了 Gemini Key 时，使用 Gemini 直接读取公开视频语音与画面，生成带近似时间点的 AI 内容记录，再按同一版式分析；长视频若未覆盖后半段，会分段补读，最多额外请求三次。笔记明确标记这不是逐字字幕。此功能依赖 Google 的预览版 YouTube URL 视频输入能力。
 - 每个频道各有一个 Obsidian 文件夹和“频道索引”，即使还没有新视频笔记也能看到该频道；笔记以北京时间的发布日期和视频标题命名，同频道内保存字幕或 AI 内容记录，不再下载封面图片。笔记包含时间点链接、Mermaid 结构图、播放量快照及资料局限。
-- 已分析视频会补取完整描述区。非加密货币频道提取 1–3 个主题；“主题索引”和主题笔记把不同频道讨论同一主题的视频双链起来。`@tiabtc`、`@CakeBaBa`、`@Traderfengge` 的日更行情笔记不生成主题关联，以日期和频道索引复盘。描述区优先使用已配置的 YouTube Data API；没有该密钥时用 TranscriptAPI 视频元数据接口（每条成功请求另用 1 个积分）。失败一小时后重试且不阻断字幕笔记。
-- 配置 `YOUTUBE_API_KEY` 后，会从 YouTube Data API v3 各取一页“相关”和“最新”公开评论，去重并筛选最多 10 条有信息量的评论，保留评论原文、点赞数、筛选原因及原评论链接。新视频发布约 24 小时后再补取一次；关闭评论或接口失败时不阻断主体笔记。
+- 已分析视频会补取完整描述区。普通创作者频道提取 1–3 个主题；“主题索引”和主题笔记把不同频道讨论同一主题的视频双链起来。`market_channels.txt` 中的频道按市场跟踪格式生成笔记，不显示差异化选题、热度判断、播放数据快照、精选评论或主题关联。描述区优先使用已配置的 YouTube Data API；没有该密钥时用 TranscriptAPI 视频元数据接口（每条成功请求另用 1 个积分）。失败一小时后重试且不阻断字幕笔记。
+- 普通创作者频道配置 `YOUTUBE_API_KEY` 后，会从 YouTube Data API v3 各取一页“相关”和“最新”公开评论，去重并筛选最多 10 条有信息量的评论。市场跟踪频道跳过评论采集。新视频发布约 24 小时后再补取一次；关闭评论或接口失败时不阻断主体笔记。
 - 自动重试暂时缺少字幕的内容；48 小时后仍无字幕则标记 unavailable。每日成功分析数量有上限。
 - 云端通过带令牌的只读 HTTPS API 提供文件，本地同步程序写入 Obsidian vault。
 
@@ -17,7 +17,7 @@
 
 ## 密钥与配置
 
-复制 `.env.example` 为 `.env`，填写以下值。`.env` 已被 Git 忽略；不要把密钥提交到仓库或贴进聊天。当前六个频道已写在 [`channels.txt`](channels.txt) 中，云端启动时自动导入；以后每行增删一个链接即可。
+复制 `.env.example` 为 `.env`，填写以下值。`.env` 已被 Git 忽略；不要把密钥提交到仓库或贴进聊天。普通创作者频道写在 [`channels.txt`](channels.txt)，市场跟踪频道写在 [`market_channels.txt`](market_channels.txt)，每行一个链接。启动时自动导入；今后新增中文、英文或日文行情频道，放进市场频道文件即可。
 
 | 变量 | 用途 |
 |---|---|
@@ -31,6 +31,8 @@
 | `RADAR_DOMAIN` | 云端域名，用于 Caddy 自动配置 HTTPS。 |
 | `OBSIDIAN_VAULT` | 本机 Obsidian 仓库的绝对路径；在 `local.env` 填写即可。 |
 | `RADAR_SERVER_URL` | `https://你的域名`。 |
+
+已分析的市场视频升级后可运行 `python3 -m radar backfill-market-views`，从本地已保存的字幕或 AI 内容记录提取观点，不重复购买字幕。每条视频会增加模型调用费用。该提取只记录博主的观点，不核验其预测，也不提供交易指令。无逐字字幕而使用 Gemini 近似内容记录时，尤其要回看原视频确认价位与条件。
 
 OpenAI 使用官方 [Responses API](https://developers.openai.com/api/docs/guides/text)；DeepSeek 使用官方 [Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)。只支持你主动选择并配置的模型。没有密钥时可运行本地单元测试，但无法进行真实采集和分析。
 
@@ -49,7 +51,7 @@ python3 -m radar run-once
 
 想验证一条旧视频，可运行 `python3 -m radar add-video VIDEO_ID`，再运行 `run-once`。它会发生字幕服务及模型调用费用。未配置密钥时，不会发起付费请求。
 
-目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`、`@tiabtc`、`@CakeBaBa`、`@Traderfengge`。设置字幕服务密钥后，先运行 `python3 -m radar check-channels`，确认链接都能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
+目前已收录 `@huangsiping`、`@7techlife`、`@sev7enshare`、`@tiabtc`、`@CakeBaBa`、`@Traderfengge`。设置字幕服务密钥后可运行 `python3 -m radar check-channels`，确认普通频道链接能解析。这个命令只访问频道最近视频接口，不调用 AI，也不下载字幕。
 
 ## 本机 Docker 验收
 

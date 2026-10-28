@@ -19,6 +19,7 @@ class Config:
     listen_host: str
     listen_port: int
     channels_file: Path = Path("channels.txt")
+    market_channels_file: Path = Path("market_channels.txt")
     youtube_api_key: str = ""
     gemini_api_key: str = ""
     gemini_video_model: str = "gemini-2.5-flash"
@@ -41,6 +42,7 @@ class Config:
             listen_host=os.getenv("RADAR_LISTEN_HOST", "127.0.0.1"),
             listen_port=int(os.getenv("RADAR_LISTEN_PORT", "8765")),
             channels_file=Path(os.getenv("RADAR_CHANNELS_FILE", "channels.txt")),
+            market_channels_file=Path(os.getenv("RADAR_MARKET_CHANNELS_FILE", "market_channels.txt")),
             youtube_api_key=os.getenv("YOUTUBE_API_KEY", ""),
             gemini_api_key=os.getenv("GEMINI_API_KEY") or os.getenv("gemini_API_KEY", ""),
             gemini_video_model=os.getenv("GEMINI_VIDEO_MODEL", "gemini-2.5-flash"),

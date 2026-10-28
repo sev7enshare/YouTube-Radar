@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from radar.analysis import classify_topics, select_valuable_comments
+from radar.analysis import classify_topics, extract_market_view, select_valuable_comments
 from radar.config import Config
 from radar.db import add_channel, add_video, artifacts_after, connect, iso, put_artifact, record_discovery, utc_now
 from radar.providers import Video, public_comments, video_description, video_duration_seconds, video_observations
@@ -28,7 +28,7 @@ class RadarTests(unittest.TestCase):
             llm_provider="openai", llm_api_key="test-key", llm_model="test-model",
             sync_token="a" * 32, poll_minutes=15, process_after_hours=3,
             daily_video_limit=20, listen_host="127.0.0.1", listen_port=0,
-            channels_file=self.root / "channels.txt",
+            channels_file=self.root / "channels.txt", market_channels_file=self.root / "market_channels.txt",
         )
 
     def test_existing_videos_are_baseline_only(self) -> None:
@@ -347,6 +347,9 @@ class RadarTests(unittest.TestCase):
                  ("123456789ab", "https://www.youtube.com/@sample", "普通频道"))
         for video_id, url, name in cases:
             add_video(db, video_id, url)
+            if url.endswith("@tiabtc"):
+                with db:
+                    db.execute("UPDATE channels SET mode='market' WHERE url=?", (url,))
             with db:
                 db.execute("""UPDATE videos SET status='analyzed', channel_name=?, title=?,
                     analysis_json=?, language='zh', published_at=?, analyzed_at=?, topics_json=? WHERE id=?""",
@@ -360,6 +363,10 @@ class RadarTests(unittest.TestCase):
             bodies[video_id] = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
                                           (path,)).fetchone()[0].decode()
         self.assertNotIn("## 主题与相关视频", bodies["abcdefghijk"])
+        for heading in ("我的差异化选题机会", "热度判断", "播放数据快照", "观众评论 · 精选"):
+            self.assertNotIn(heading, bodies["abcdefghijk"])
+            self.assertIn(heading, bodies["123456789ab"])
+        self.assertIn("## 本期市场观点", bodies["abcdefghijk"])
         self.assertIn("topics: []", bodies["abcdefghijk"])
         self.assertIn("## 主题与相关视频", bodies["123456789ab"])
         self.assertNotIn("行情频道", bodies["123456789ab"])
@@ -375,6 +382,18 @@ class RadarTests(unittest.TestCase):
             counts = enrich_analyzed(db, self.config, now)
         self.assertEqual(counts["topics"], 0)
         db.close()
+
+    def test_market_view_requires_valid_source_ids(self) -> None:
+        segments = [{"start": 42, "text": "若突破十万，短线看多。"}]
+        answer = {"overview": "条件性偏多", "positions": [
+            {"asset": "BTC", "horizon": "短线", "stance": "条件性", "view": "突破后看多",
+             "condition": "突破十万", "invalidation": "", "source_ids": [0]},
+            {"asset": "ETH", "horizon": "", "stance": "偏空", "view": "下跌",
+             "condition": "", "invalidation": "", "source_ids": [999]}], "levels": []}
+        with patch("radar.analysis._call_llm", return_value=answer):
+            result = extract_market_view(self.config, "市场", segments)
+        self.assertEqual(len(result["positions"]), 1)
+        self.assertEqual(result["positions"][0]["sources"][0]["start_seconds"], 42)
 
     def test_youtube_metadata_and_comment_sampling(self) -> None:
         calls = []

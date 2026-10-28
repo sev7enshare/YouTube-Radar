@@ -10,7 +10,7 @@ from .config import Config
 from .db import add_channel, add_video, connect
 from .providers import latest_videos
 from .sync import start_server, sync_to_vault
-from .worker import run_once
+from .worker import backfill_market_views, run_once
 
 
 def main() -> None:
@@ -23,6 +23,7 @@ def main() -> None:
     sub.add_parser("list", help="List tracked channels and recent videos")
     sub.add_parser("check-channels", help="Validate configured channels without running AI analysis")
     sub.add_parser("run-once", help="Check channels and process due videos")
+    sub.add_parser("backfill-market-views", help="Extract market views from stored video text")
     sub.add_parser("serve", help="Run the cloud worker and sync API")
     sync = sub.add_parser("sync", help="Pull notes into an Obsidian vault")
     sync.add_argument("--url", default=os.getenv("RADAR_SERVER_URL", "http://127.0.0.1:8765"))
@@ -85,6 +86,13 @@ def main() -> None:
         return
     if args.command == "run-once":
         print(run_once(config))
+        return
+    if args.command == "backfill-market-views":
+        config.require_worker_keys()
+        completed, failed = backfill_market_views(config)
+        print(f"Market views: {completed} completed, {failed} failed")
+        if failed:
+            raise SystemExit(1)
         return
     config.require_worker_keys()
     server = start_server(config)

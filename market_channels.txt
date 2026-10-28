@@ -1,0 +1,4 @@
+# Market analysis channels. Add future crypto channels here, one URL per line.
+https://www.youtube.com/@tiabtc
+https://www.youtube.com/@CakeBaBa
+https://www.youtube.com/@Traderfengge
