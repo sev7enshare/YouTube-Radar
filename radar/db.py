@@ -20,6 +20,7 @@ def connect(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS channels (
@@ -57,7 +58,9 @@ def connect(path: Path) -> sqlite3.Connection:
             comments_json TEXT,
             comments_round INTEGER NOT NULL DEFAULT 0,
             comments_next_attempt_at TEXT,
-            comments_error TEXT
+            comments_error TEXT,
+            chart_checked_at TEXT,
+            chart_next_attempt_at TEXT
         );
         CREATE INDEX IF NOT EXISTS videos_pending ON videos(status, next_attempt_at);
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -65,6 +68,20 @@ def connect(path: Path) -> sqlite3.Connection:
             captured_at TEXT NOT NULL,
             view_count INTEGER NOT NULL,
             PRIMARY KEY(video_id, captured_at)
+        );
+        CREATE TABLE IF NOT EXISTS market_days (
+            video_id TEXT NOT NULL REFERENCES videos(id),
+            symbol TEXT NOT NULL,
+            day_number INTEGER NOT NULL,
+            window_start TEXT NOT NULL,
+            window_end TEXT NOT NULL,
+            open TEXT NOT NULL,
+            high TEXT NOT NULL,
+            low TEXT NOT NULL,
+            close TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            venue TEXT NOT NULL DEFAULT 'Binance',
+            PRIMARY KEY(video_id, symbol, day_number)
         );
         CREATE TABLE IF NOT EXISTS artifacts (
             revision INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +93,9 @@ def connect(path: Path) -> sqlite3.Connection:
     """)
     columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
     channel_columns = {row[1] for row in db.execute("PRAGMA table_info(channels)")}
+    market_columns = {row[1] for row in db.execute("PRAGMA table_info(market_days)")}
+    if "venue" not in market_columns:
+        db.execute("ALTER TABLE market_days ADD COLUMN venue TEXT NOT NULL DEFAULT 'Binance'")
     if "mode" not in channel_columns:
         db.execute("ALTER TABLE channels ADD COLUMN mode TEXT NOT NULL DEFAULT 'creator'")
     additions = {
@@ -89,6 +109,8 @@ def connect(path: Path) -> sqlite3.Connection:
         "comments_next_attempt_at": "TEXT",
         "comments_error": "TEXT",
         "source_kind": "TEXT NOT NULL DEFAULT 'captions'",
+        "chart_checked_at": "TEXT",
+        "chart_next_attempt_at": "TEXT",
     }
     for name, definition in additions.items():
         if name not in columns:

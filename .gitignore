@@ -5,4 +5,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+.playwright-cli/
+output/playwright/
 

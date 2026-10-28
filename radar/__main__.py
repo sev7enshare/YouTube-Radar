@@ -10,7 +10,9 @@ from .config import Config
 from .db import add_channel, add_video, connect
 from .providers import latest_videos
 from .sync import start_server, sync_to_vault
-from .worker import backfill_market_views, run_once
+from .worker import backfill_market_charts, backfill_market_views, run_once
+from .market_data import record_market_days
+from .db import utc_now
 
 
 def main() -> None:
@@ -24,6 +26,8 @@ def main() -> None:
     sub.add_parser("check-channels", help="Validate configured channels without running AI analysis")
     sub.add_parser("run-once", help="Check channels and process due videos")
     sub.add_parser("backfill-market-views", help="Extract market views from stored video text")
+    sub.add_parser("backfill-market-charts", help="Collect spoken chart references and video timestamps")
+    sub.add_parser("refresh-market-data", help="Record completed 24-hour Binance market windows")
     sub.add_parser("serve", help="Run the cloud worker and sync API")
     sync = sub.add_parser("sync", help="Pull notes into an Obsidian vault")
     sync.add_argument("--url", default=os.getenv("RADAR_SERVER_URL", "http://127.0.0.1:8765"))
@@ -93,6 +97,20 @@ def main() -> None:
         print(f"Market views: {completed} completed, {failed} failed")
         if failed:
             raise SystemExit(1)
+        return
+    if args.command == "backfill-market-charts":
+        completed, failed = backfill_market_charts(config)
+        print(f"Chart inspections: {completed} completed, {failed} deferred")
+        return
+    if args.command == "refresh-market-data":
+        db = connect(config.db_path)
+        try:
+            from .worker import refresh_notes
+            count = record_market_days(db, utc_now())
+            refresh_notes(db, utc_now(), force_all=True)
+            print(f"Market windows recorded: {count}")
+        finally:
+            db.close()
         return
     config.require_worker_keys()
     server = start_server(config)

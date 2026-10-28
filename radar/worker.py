@@ -6,14 +6,16 @@ import sqlite3
 from hashlib import sha256
 from datetime import datetime, timedelta
 
-from .analysis import analyze, classify_topics, extract_market_view, select_valuable_comments
+from .analysis import analyze, classify_topics, extract_market_view, market_windows, select_valuable_comments
+from .chart import chart_candidates
 from .config import Config
 from .db import (add_channel, connect, due_videos, finish_video, iso, processed_today,
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
+from .market_data import days_for, record_market_days
 from .providers import (latest_videos, parse_timestamp, public_comments, transcript, video_description,
                         video_duration_seconds, video_observations)
-from .render import (note_path, published_local, render_channel_index, render_index, render_note,
+from .render import (note_path, published_local, render_channel_index, render_market_channel_index, render_index, render_note,
                      render_topic_index, render_topic_note, render_transcript, safe_component, transcript_path,
                      topic_path)
 
@@ -98,7 +100,8 @@ def migrate_legacy_artifacts(db: sqlite3.Connection, now: datetime) -> None:
                          "text/markdown", now)
             note = render_note(fresh, analysis, row["language"], snapshots_for(db, row["id"]),
                                include_topics=row["channel_ref"] not in market_channel_ids(db),
-                               market_mode=row["channel_ref"] in market_channel_ids(db))
+                               market_mode=row["channel_ref"] in market_channel_ids(db),
+                               market_days=days_for(db, row["id"]))
             put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
             for path in (old_note, old_transcript, old_image):
                 retire_artifact(db, path, now)
@@ -151,10 +154,12 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
         with db:
             db.execute("UPDATE videos SET transcript_json=?, language=?, source_kind=? WHERE id=?",
                        (json.dumps(segments, ensure_ascii=False), language, source_kind, video_id))
-    analysis = analyze(config, row["title"], segments, source_kind)
     is_market = row["channel_ref"] in market_channel_ids(db)
     if is_market:
-        analysis["market_view"] = extract_market_view(config, row["title"], segments, source_kind)
+        analysis = {"market_view": extract_market_view(config, row["title"], segments, source_kind),
+                    "limits": "仅依据字幕与另行核对的画面；行情结果不代表交易盈亏。"}
+    else:
+        analysis = analyze(config, row["title"], segments, source_kind)
     if source_kind == "gemini_video" and video_duration and max(item["start"] for item in segments) < video_duration * 0.9:
         analysis["limits"] = (str(analysis.get("limits") or "").strip() +
                               " AI 内容记录可能未覆盖视频结尾，请打开原视频核对。").strip()
@@ -165,7 +170,8 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
         put_artifact(db, transcript_path(fresh),
                      render_transcript(fresh, segments, language).encode(), "text/markdown", now)
         note = render_note(fresh, analysis, language, snapshots_for(db, video_id),
-                           include_topics=not is_market, market_mode=is_market)
+                           include_topics=not is_market, market_mode=is_market,
+                           market_days=days_for(db, video_id))
         put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
     log.info("Analyzed %s", video_id)
 
@@ -247,6 +253,40 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
     return counts
 
 
+def enrich_market_charts(db: sqlite3.Connection, config: Config, now: datetime,
+                         limit: int = 3) -> tuple[int, int]:
+    """Attach source passages to chart references; never infer a visual from subtitles."""
+    rows = db.execute("""SELECT v.* FROM videos v JOIN channels c ON c.id=v.channel_ref
+        WHERE c.mode='market' AND v.status='analyzed' AND v.transcript_json IS NOT NULL
+        AND v.chart_checked_at IS NULL AND
+        (v.chart_next_attempt_at IS NULL OR v.chart_next_attempt_at<=?)
+        ORDER BY v.published_at DESC LIMIT ?""", (iso(now), limit)).fetchall()
+    completed = failed = 0
+    for row in rows:
+        candidates = chart_candidates(json.loads(row["transcript_json"]))
+        if not candidates:
+            with db:
+                db.execute("UPDATE videos SET chart_checked_at=? WHERE id=?", (iso(now), row["id"]))
+            completed += 1
+            continue
+        evidence = []
+        windows = market_windows(json.loads(row["transcript_json"]))
+        for candidate in candidates:
+            at = candidate["at"]
+            evidence.append({"start_seconds": max(0, at - 15), "topic": candidate["topic"],
+                "verified_frame": False,
+                "source_passages": [{"start_seconds": w["start_seconds"], "text": w["text"]}
+                    for w in windows if at - 15 <= w["start_seconds"] <= at + 80][:5]})
+        analysis = json.loads(row["analysis_json"])
+        analysis["chart_evidence"] = evidence
+        with db:
+            db.execute("""UPDATE videos SET analysis_json=?, chart_checked_at=?,
+                chart_next_attempt_at=NULL WHERE id=?""",
+                (json.dumps(analysis, ensure_ascii=False), iso(now), row["id"]))
+        completed += 1
+    return completed, failed
+
+
 def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False) -> None:
     rows = db.execute("SELECT * FROM videos WHERE status='analyzed' AND artifact_base IS NOT NULL").fetchall()
     no_topics = market_channel_ids(db)
@@ -275,7 +315,8 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
             note = render_note(row, json.loads(row["analysis_json"]), row["language"],
                                snapshots_for(db, row["id"]), own_topics, related, comments,
                                include_topics=row["channel_ref"] not in no_topics,
-                               market_mode=row["channel_ref"] in no_topics)
+                               market_mode=row["channel_ref"] in no_topics,
+                               market_days=days_for(db, row["id"]))
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
         put_artifact(db, "YouTube Radar/主题索引.md", render_topic_index(groups).encode(), "text/markdown", now)
@@ -296,8 +337,11 @@ def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
             folder = channel_folder(db, channel["id"], channel["name"])
             videos = db.execute("""SELECT * FROM videos WHERE channel_ref=? AND status='analyzed'
                 ORDER BY published_at DESC LIMIT 100""", (channel["id"],)).fetchall()
+            body = (render_market_channel_index(channel["name"], channel["url"], videos)
+                    if channel["mode"] == "market" else
+                    render_channel_index(channel["name"], channel["url"], videos))
             put_artifact(db, f"YouTube Radar/{folder}/频道索引.md",
-                         render_channel_index(channel["name"], channel["url"], videos).encode(),
+                         body.encode(),
                          "text/markdown", now)
 
 
@@ -312,7 +356,7 @@ def backfill_market_views(config: Config) -> tuple[int, int]:
             ORDER BY v.published_at DESC""").fetchall()
         for row in rows:
             analysis = json.loads(row["analysis_json"])
-            if analysis.get("market_view"):
+            if (analysis.get("market_view") or {}).get("version") == 2:
                 continue
             try:
                 analysis["market_view"] = extract_market_view(
@@ -331,12 +375,23 @@ def backfill_market_views(config: Config) -> tuple[int, int]:
         db.close()
 
 
+def backfill_market_charts(config: Config) -> tuple[int, int]:
+    db = connect(config.db_path)
+    try:
+        import_channel_files(db, config)
+        counts = enrich_market_charts(db, config, utc_now(), limit=1000)
+        refresh_notes(db, utc_now(), force_all=True)
+        return counts
+    finally:
+        db.close()
+
+
 def run_once(config: Config) -> dict[str, int]:
     config.require_worker_keys()
     db = connect(config.db_path)
     now = utc_now()
     counts = {"channels": 0, "new_videos": 0, "analyzed": 0, "errors": 0, "covers_removed": 0,
-              "descriptions": 0, "topics": 0, "comments": 0}
+              "descriptions": 0, "topics": 0, "comments": 0, "market_days": 0, "charts": 0}
     try:
         import_channel_files(db, config)
         migrate_legacy_artifacts(db, now)
@@ -370,8 +425,11 @@ def run_once(config: Config) -> dict[str, int]:
                 retry_video(db, row["id"], str(exc), now, min(240, 30 * 2 ** min(row["attempts"], 3)))
                 log.exception("Analysis failed for %s", row["id"])
         counts.update(enrich_analyzed(db, config, now))
+        counts["charts"], chart_errors = enrich_market_charts(db, config, now)
+        counts["errors"] += chart_errors
+        counts["market_days"] = record_market_days(db, now)
         refresh_notes(db, now, force_all=any(counts[key] for key in
-                      ("analyzed", "descriptions", "topics", "comments", "covers_removed")))
+                      ("analyzed", "descriptions", "topics", "comments", "covers_removed", "market_days", "charts")))
         refresh_channel_indexes(db, now)
         recent = db.execute("""SELECT * FROM videos WHERE status!='ignored' AND published_at>=?
             ORDER BY published_at DESC LIMIT 100""", (iso(now - timedelta(days=7)),)).fetchall()

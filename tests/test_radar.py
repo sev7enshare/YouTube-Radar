@@ -4,18 +4,21 @@ import tempfile
 import unittest
 import base64
 import json
+import urllib.error
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from radar.analysis import classify_topics, extract_market_view, select_valuable_comments
+from radar.chart import chart_candidates
 from radar.config import Config
 from radar.db import add_channel, add_video, artifacts_after, connect, iso, put_artifact, record_discovery, utc_now
 from radar.providers import Video, public_comments, video_description, video_duration_seconds, video_observations
 from radar.http_client import HttpError
+from radar.market_data import record_market_days, strict_price
 from radar.sync import safe_artifact_path, sync_to_vault
-from radar.worker import assign_artifact_base, enrich_analyzed, refresh_notes, run_once
+from radar.worker import assign_artifact_base, enrich_analyzed, refresh_channel_indexes, refresh_notes, run_once
 
 
 class RadarTests(unittest.TestCase):
@@ -367,6 +370,8 @@ class RadarTests(unittest.TestCase):
             self.assertNotIn(heading, bodies["abcdefghijk"])
             self.assertIn(heading, bodies["123456789ab"])
         self.assertIn("## 本期市场观点", bodies["abcdefghijk"])
+        self.assertNotIn("## 开头钩子", bodies["abcdefghijk"])
+        self.assertNotIn("## 内容结构", bodies["abcdefghijk"])
         self.assertIn("topics: []", bodies["abcdefghijk"])
         self.assertIn("## 主题与相关视频", bodies["123456789ab"])
         self.assertNotIn("行情频道", bodies["123456789ab"])
@@ -387,13 +392,56 @@ class RadarTests(unittest.TestCase):
         segments = [{"start": 42, "text": "若突破十万，短线看多。"}]
         answer = {"overview": "条件性偏多", "positions": [
             {"asset": "BTC", "horizon": "短线", "stance": "条件性", "view": "突破后看多",
-             "condition": "突破十万", "invalidation": "", "source_ids": [0]},
+             "quote": "若突破十万，短线看多。", "condition": "突破十万",
+             "condition_quote": "若突破十万", "invalidation": "假突破",
+             "invalidation_quote": "", "source_ids": [0]},
             {"asset": "ETH", "horizon": "", "stance": "偏空", "view": "下跌",
-             "condition": "", "invalidation": "", "source_ids": [999]}], "levels": []}
+             "quote": "下跌", "condition": "", "invalidation": "", "source_ids": [999]}], "levels": []}
         with patch("radar.analysis._call_llm", return_value=answer):
             result = extract_market_view(self.config, "市场", segments)
         self.assertEqual(len(result["positions"]), 1)
         self.assertEqual(result["positions"][0]["sources"][0]["start_seconds"], 42)
+        self.assertEqual(result["positions"][0]["invalidation"], "")
+        self.assertEqual(result["positions"][0]["condition_quote"], "若突破十万")
+
+    def test_chart_candidates_find_spoken_ratio(self) -> None:
+        segments = [{"start": 10, "text": "普通开头"},
+                    {"start": 86, "text": "画一下0.618和0.66"},
+                    {"start": 100, "text": "同一段继续"}]
+        self.assertEqual(chart_candidates(segments)[0]["at"], 86)
+        self.assertIsNone(strict_price("0.618"))
+        self.assertIsNone(strict_price("8万4"))
+        self.assertEqual(str(strict_price("82,400 USDT")), "82400")
+
+    def test_market_data_fallback_is_labeled_and_does_not_score_prediction(self) -> None:
+        db = connect(self.config.db_path)
+        add_video(db, "abcdefghijk", "https://www.youtube.com/@tiabtc")
+        start = utc_now() - timedelta(days=3)
+        view = {"version": 2, "positions": [{"asset": "BTC", "quote": "后续关注", "view": "观察"}],
+                "statements": [], "levels": []}
+        with db:
+            db.execute("UPDATE channels SET mode='market', name='TiaBTC' WHERE url=?", ("https://www.youtube.com/@tiabtc",))
+            db.execute("""UPDATE videos SET status='analyzed', channel_name='TiaBTC', title='行情',
+                language='zh', source_kind='captions', published_at=?, analysis_json=? WHERE id=?""",
+                (iso(start), json.dumps({"market_view": view}), "abcdefghijk"))
+            assign_artifact_base(db, db.execute("SELECT * FROM videos WHERE id=?", ("abcdefghijk",)).fetchone())
+        first = int(start.timestamp() // 3600 + 1) * 3600
+        bars = [[int((first + n * 3600) * 1000), "100", "105", "95", "101"] for n in range(72)]
+        blocked = urllib.error.HTTPError("https://fapi.binance.com", 451, "restricted", {}, None)
+        self.addCleanup(blocked.close)
+        with patch("radar.market_data.fetch_hourly_klines", side_effect=blocked), \
+             patch("radar.market_data.fetch_okx_hourly_klines", return_value=bars):
+            recorded = record_market_days(db, utc_now(), max_days=2)
+        self.assertEqual(recorded, 2)
+        refresh_notes(db, utc_now(), force_all=True)
+        path = db.execute("SELECT artifact_base FROM videos WHERE id=?", ("abcdefghijk",)).fetchone()[0] + ".md"
+        note = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1", (path,)).fetchone()[0].decode()
+        self.assertIn("| OKX | BTCUSDT | 第 1 天", note)
+        self.assertIn("不自动判定博主对错", note)
+        refresh_channel_indexes(db, utc_now())
+        channel_index = db.execute("SELECT body FROM artifacts WHERE path LIKE '%/频道索引.md' ORDER BY revision DESC LIMIT 1").fetchone()[0].decode()
+        self.assertIn("市场观点时间线", channel_index)
+        db.close()
 
     def test_youtube_metadata_and_comment_sampling(self) -> None:
         calls = []
