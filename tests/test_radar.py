@@ -334,8 +334,7 @@ class RadarTests(unittest.TestCase):
             AND path NOT LIKE '%/字幕/%' ORDER BY revision""").fetchall()
         rendered = [row["body"].decode() for row in notes if "订阅方案" in row["path"]]
         self.assertEqual(len(rendered), 2)
-        self.assertTrue(all("这是完整描述区" in text and "共同主题：AI订阅支付" in text
-                            and "comment.1" in text for text in rendered))
+        self.assertTrue(all("这是完整描述区" in text and "共同主题：AI订阅支付" in text for text in rendered))
         index = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
                            ("YouTube Radar/主题索引.md",)).fetchone()["body"].decode()
         self.assertIn("AI订阅支付", index)
@@ -366,9 +365,11 @@ class RadarTests(unittest.TestCase):
             bodies[video_id] = db.execute("SELECT body FROM artifacts WHERE path=? ORDER BY revision DESC LIMIT 1",
                                           (path,)).fetchone()[0].decode()
         self.assertNotIn("## 主题与相关视频", bodies["abcdefghijk"])
-        for heading in ("我的差异化选题机会", "热度判断", "播放数据快照", "观众评论 · 精选"):
+        self.assertNotIn("我的差异化选题机会", bodies["abcdefghijk"])
+        self.assertIn("我的差异化选题机会", bodies["123456789ab"])
+        for heading in ("热度判断", "播放数据快照", "观众评论 · 精选"):
             self.assertNotIn(heading, bodies["abcdefghijk"])
-            self.assertIn(heading, bodies["123456789ab"])
+            self.assertNotIn(heading, bodies["123456789ab"])
         self.assertIn("## 本期市场观点", bodies["abcdefghijk"])
         self.assertNotIn("## 开头钩子", bodies["abcdefghijk"])
         self.assertNotIn("## 内容结构", bodies["abcdefghijk"])

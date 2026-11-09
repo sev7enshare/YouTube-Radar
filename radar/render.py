@@ -231,25 +231,6 @@ def render_note(row: sqlite3.Row, analysis: dict[str, Any], language: str,
     lines += ["", "## 视频描述区原文", ""]
     description = str(row["description"] or "").strip()
     lines += source_quote(description) if description else ["尚未取得描述区内容。"]
-    if not market_mode:
-        lines += ["", "## 观众评论 · 精选", ""]
-        if comments is None:
-            lines.append("尚未采集评论；需要启用 YouTube Data API v3。")
-        elif not comments:
-            lines.append("暂无可用的公开评论。")
-        else:
-            lines.append("评论反映个别观众体验，不代表全部观众；原文可能随后被作者修改或删除。")
-            for item in comments[:10]:
-                url = f"https://www.youtube.com/watch?v={video_id}&lc={quote(str(item['id']), safe='')}"
-                category = safe_text(item.get("category"))
-                lines += ["", f"### [{category} · {int(item.get('likes') or 0)} 赞]({url})", ""]
-                lines += source_quote(str(item.get("text") or ""))
-                if item.get("why"):
-                    lines.append(f"筛选原因：{safe_text(item['why'])}")
-        lines += ["", "## 播放数据快照", "", "| 采集时间 UTC | 播放量 |", "|---|---:|"]
-        for snapshot in snapshots[-20:]:
-            lines.append(f"| {snapshot['captured_at']} | {snapshot['view_count']:,} |")
-        lines += ["", "> [!note] 热度判断", "> 播放量需与同频道、同视频类型、相同发布时长的数据比较。积累足够同期快照后再给出相对热度。", ""]
     lines += ["", "## 资料局限", "", safe_text(analysis.get("limits")) or "仅依据字幕，未核验画面内容。", ""]
     return "\n".join(lines)
 

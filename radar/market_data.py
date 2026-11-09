@@ -100,7 +100,7 @@ def record_market_days(db: sqlite3.Connection, now: datetime, max_days: int = 30
         for symbol in sorted(symbols):
             existing = db.execute("SELECT venue FROM market_days WHERE video_id=? LIMIT 1",
                                   (row["id"],)).fetchone()
-            venue = existing["venue"] if existing else ("OKX" if binance_blocked else "Binance")
+            venue = "OKX" if binance_blocked else (existing["venue"] if existing else "Binance")
             missing = [day for day in range(1, completed + 1) if not db.execute(
                 "SELECT 1 FROM market_days WHERE video_id=? AND symbol=? AND day_number=?",
                 (row["id"], symbol, day)).fetchone()]
@@ -117,7 +117,7 @@ def record_market_days(db: sqlite3.Connection, now: datetime, max_days: int = 30
                     try:
                         candles = fetch_hourly_klines(symbol, first_range, last_range - timedelta(milliseconds=1))
                     except urllib.error.HTTPError as exc:
-                        if exc.code != 451 or existing:
+                        if exc.code != 451:
                             raise
                         binance_blocked = True
                         venue = "OKX"
