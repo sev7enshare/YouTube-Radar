@@ -13,11 +13,12 @@ from .db import (add_channel, connect, due_videos, finish_video, iso, processed_
                  put_artifact, record_discovery, retry_video, set_channel_error, utc_now)
 from .http_client import HttpError
 from .market_data import days_for, record_market_days
-from .providers import (latest_videos, parse_timestamp, public_comments, transcript, video_description,
-                        video_duration_seconds, video_observations)
-from .render import (note_path, published_local, render_channel_index, render_market_channel_index, render_index, render_note,
-                     render_topic_index, render_topic_note, render_transcript, safe_component, transcript_path,
-                     topic_path)
+from .providers import (inspect_chart_clip, latest_videos, parse_timestamp, public_comments, transcript,
+                        video_description, video_duration_seconds, video_observations)
+from .render import (note_path, published_local, render_channel_index, render_index,
+                     render_market_channel_index, render_market_panorama, render_note,
+                     render_topic_index, render_topic_note, render_transcript, safe_component,
+                     topic_path, transcript_path)
 
 
 log = logging.getLogger(__name__)
@@ -112,6 +113,15 @@ def snapshots_for(db: sqlite3.Connection, video_id: str) -> list[sqlite3.Row]:
     return db.execute("SELECT * FROM snapshots WHERE video_id=? ORDER BY captured_at", (video_id,)).fetchall()
 
 
+def prior_market_videos(db: sqlite3.Connection, row: sqlite3.Row,
+                        limit: int = 3) -> list[tuple[sqlite3.Row, list[sqlite3.Row]]]:
+    priors = db.execute("""SELECT * FROM videos
+        WHERE channel_ref=? AND status='analyzed' AND id!=? AND published_at<?
+        ORDER BY published_at DESC LIMIT ?""",
+        (row["channel_ref"], row["id"], row["published_at"], limit)).fetchall()
+    return [(p, days_for(db, p["id"])) for p in priors]
+
+
 def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now: datetime) -> None:
     video_id = row["id"]
     source_kind = row["source_kind"] or "captions"
@@ -171,7 +181,8 @@ def analyze_video(db: sqlite3.Connection, row: sqlite3.Row, config: Config, now:
                      render_transcript(fresh, segments, language).encode(), "text/markdown", now)
         note = render_note(fresh, analysis, language, snapshots_for(db, video_id),
                            include_topics=not is_market, market_mode=is_market,
-                           market_days=days_for(db, video_id))
+                           market_days=days_for(db, video_id),
+                           prior_videos=prior_market_videos(db, fresh) if is_market else None)
         put_artifact(db, note_path(fresh), note.encode(), "text/markdown", now)
     log.info("Analyzed %s", video_id)
 
@@ -189,8 +200,8 @@ def enrich_analyzed(db: sqlite3.Connection, config: Config, now: datetime) -> di
                     catalog.append(name)
     for row in rows:
         video_id = row["id"]
-        if not row["metadata_checked_at"] and (not row["metadata_next_attempt_at"] or
-                                                  row["metadata_next_attempt_at"] <= iso(now)):
+        if row["channel_ref"] not in no_topics and not row["metadata_checked_at"] and (
+                not row["metadata_next_attempt_at"] or row["metadata_next_attempt_at"] <= iso(now)):
             try:
                 description = video_description(video_id, config.transcript_api_key, config.youtube_api_key)
                 with db:
@@ -273,10 +284,26 @@ def enrich_market_charts(db: sqlite3.Connection, config: Config, now: datetime,
         windows = market_windows(json.loads(row["transcript_json"]))
         for candidate in candidates:
             at = candidate["at"]
-            evidence.append({"start_seconds": max(0, at - 15), "topic": candidate["topic"],
+            passages = [{"start_seconds": w["start_seconds"], "text": w["text"]}
+                        for w in windows if at - 15 <= w["start_seconds"] <= at + 80][:5]
+            entry: dict[str, object] = {
+                "start_seconds": max(0, at - 15),
+                "topic": candidate["topic"],
                 "verified_frame": False,
-                "source_passages": [{"start_seconds": w["start_seconds"], "text": w["text"]}
-                    for w in windows if at - 15 <= w["start_seconds"] <= at + 80][:5]})
+                "source_passages": passages,
+            }
+            if config.gemini_api_key:
+                try:
+                    spoken = " ".join(p["text"] for p in passages)
+                    visual = inspect_chart_clip(row["id"], config.gemini_api_key, config.gemini_video_model,
+                                                max(0, at - 15), at + 75, spoken)
+                    if visual.get("has_chart") and visual.get("visual_summary"):
+                        entry["verified_frame"] = True
+                        entry["visual_check"] = visual["visual_summary"]
+                        entry["visual_levels"] = visual.get("levels") or []
+                except Exception as exc:
+                    log.warning("Visual chart check skipped for %s at %ss: %s", row["id"], at, exc)
+            evidence.append(entry)
         analysis = json.loads(row["analysis_json"])
         analysis["chart_evidence"] = evidence
         with db:
@@ -312,11 +339,13 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
                     related.append((note_path(other), other["title"], shared))
             related.sort(key=lambda item: item[0], reverse=True)
             comments = json.loads(row["comments_json"]) if row["comments_json"] is not None else None
+            is_mkt = row["channel_ref"] in no_topics
             note = render_note(row, json.loads(row["analysis_json"]), row["language"],
                                snapshots_for(db, row["id"]), own_topics, related, comments,
-                               include_topics=row["channel_ref"] not in no_topics,
-                               market_mode=row["channel_ref"] in no_topics,
-                               market_days=days_for(db, row["id"]))
+                               include_topics=not is_mkt,
+                               market_mode=is_mkt,
+                               market_days=days_for(db, row["id"]),
+                               prior_videos=prior_market_videos(db, row) if is_mkt else None)
             put_artifact(db, note_path(row), note.encode(), "text/markdown", now)
             db.execute("UPDATE videos SET note_refreshed_at=? WHERE id=?", (iso(now), row["id"]))
         put_artifact(db, "YouTube Radar/主题索引.md", render_topic_index(groups).encode(), "text/markdown", now)
@@ -332,17 +361,28 @@ def refresh_notes(db: sqlite3.Connection, now: datetime, force_all: bool = False
 
 def refresh_channel_indexes(db: sqlite3.Connection, now: datetime) -> None:
     channels = db.execute("SELECT * FROM channels WHERE url!='@manual' AND name IS NOT NULL ORDER BY id").fetchall()
+    market_channels = [c for c in channels if c["mode"] == "market"]
+    videos_by_channel: dict[int, list[sqlite3.Row]] = {}
+    days_by_video: dict[str, list[sqlite3.Row]] = {}
     with db:
         for channel in channels:
             folder = channel_folder(db, channel["id"], channel["name"])
             videos = db.execute("""SELECT * FROM videos WHERE channel_ref=? AND status='analyzed'
                 ORDER BY published_at DESC LIMIT 100""", (channel["id"],)).fetchall()
-            body = (render_market_channel_index(channel["name"], channel["url"], videos)
-                    if channel["mode"] == "market" else
-                    render_channel_index(channel["name"], channel["url"], videos))
+            videos_by_channel[channel["id"]] = videos
+            if channel["mode"] == "market":
+                for v in videos:
+                    days_by_video[v["id"]] = days_for(db, v["id"])
+                body = render_market_channel_index(channel["name"], channel["url"], videos, days_by_video)
+            else:
+                body = render_channel_index(channel["name"], channel["url"], videos)
             put_artifact(db, f"YouTube Radar/{folder}/频道索引.md",
                          body.encode(),
                          "text/markdown", now)
+        if market_channels:
+            panorama = render_market_panorama(market_channels, videos_by_channel, days_by_video, now)
+            put_artifact(db, "YouTube Radar/加密博主多空全景看板.md",
+                         panorama.encode(), "text/markdown", now)
 
 
 def backfill_market_views(config: Config) -> tuple[int, int]:
